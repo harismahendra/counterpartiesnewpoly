@@ -1,0 +1,48 @@
+services:
+  # Backend Service (Python FastAPI)
+  - type: web
+    name: ws-dome-backend
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: cd backend && pip install -r requirements.txt
+    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DOME_API_KEY
+        sync: false
+      - key: PLATFORM
+        value: polymarket
+      - key: WS_VERSION
+        value: 1
+      - key: BACKEND_PORT
+        fromService:
+          type: web
+          name: ws-dome-backend
+          property: port
+      - key: DATABASE_URL_POLY
+        sync: false
+      # Wallet addresses - add as many as needed
+      - key: WALLET_1_ADDRESS
+        sync: false
+      - key: WALLET_2_ADDRESS
+        sync: false
+      - key: WALLET_3_ADDRESS
+        sync: false
+      # Or use comma-separated format
+      - key: WALLET_ADDRESSES
+        sync: false
+
+  # Frontend Service (Static Site)
+  - type: web
+    name: ws-dome-frontend
+    env: static
+    region: oregon
+    plan: starter
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/dist
+    envVars:
+      - key: VITE_BACKEND_URL
+        fromService:
+          type: web
+          name: ws-dome-backend
+          property: host
