@@ -1064,7 +1064,7 @@ async def handle_dome_message(message: str):
         if data.get('type') == 'ack' and data.get('subscription_id'):
             subscription_id = data['subscription_id']
             subscriptions[subscription_id] = {
-                'created_at': datetime.now().isoformat(),
+                'created_at': datetime.now(timezone.utc).isoformat(),
                 'platform': PLATFORM
             }
             print(f"✅ Subscription acknowledged: {subscription_id}")
@@ -1073,7 +1073,7 @@ async def handle_dome_message(message: str):
         if data.get('type') == 'event' and data.get('subscription_id') and data.get('data'):
             order_data = data['data']
             order_data['subscription_id'] = data['subscription_id']
-            order_data['received_at'] = datetime.now().isoformat()
+            order_data['received_at'] = datetime.now(timezone.utc).isoformat()
             
             print(f"📊 Order update: {order_data.get('side')} {order_data.get('token_label')} @ ${order_data.get('price')}")
             

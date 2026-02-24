@@ -155,6 +155,16 @@ function formatTimeAgo(dateString) {
   }
 }
 
+function parseReceivedAt(receivedAt) {
+  if (!receivedAt) return new Date();
+  const raw = String(receivedAt);
+  // If timestamp is naive (no timezone suffix), treat it as UTC for consistency.
+  const hasTimezone = /([zZ]|[+\-]\d{2}:\d{2})$/.test(raw);
+  const normalized = hasTimezone ? raw : `${raw}Z`;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
 function calculatePolymarketPercentage(fillPrice, pmData) {
   if (!pmData || pmData.bbo === undefined || pmData.bbo === null || !fillPrice || fillPrice === 0) {
     return null;
@@ -393,7 +403,7 @@ function getOrderTimestampMs(order) {
     return order.timestamp * 1000;
   }
   if (order && order.received_at) {
-    const receivedMs = new Date(order.received_at).getTime();
+    const receivedMs = parseReceivedAt(order.received_at).getTime();
     if (!Number.isNaN(receivedMs)) {
       return receivedMs;
     }
@@ -1486,7 +1496,7 @@ function handleOrderUpdate(data, skipStats = false) {
 
     let receivedDate;
     if (data.received_at) {
-      receivedDate = new Date(data.received_at);
+      receivedDate = parseReceivedAt(data.received_at);
     } else {
       receivedDate = new Date();
     }
