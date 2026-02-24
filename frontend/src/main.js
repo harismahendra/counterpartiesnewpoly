@@ -10,7 +10,7 @@ let orderCount = 0;
 let buyCount = 0;
 let sellCount = 0;
 let totalVolume = 0;
-const maxRows = 100;
+const maxRows = 4000;
 const ordersMap = new Map(); // Track orders by unique ID
 
 // Debounce timers for summary updates
@@ -24,7 +24,7 @@ const columnVisibility = {
   'received-at': true,
   'side': false,
   'league': true,
-  'title': true,
+  'title': false,
   'token-label': true,
   'token-id': false,
   'market-slug': false,
@@ -35,7 +35,7 @@ const columnVisibility = {
   'value': true,
   'block-number': false,
   'log-index': false,
-  'user': true,
+  'user': false,
   'taker': true,
   'order-hash': false,
   'tx-hash': true,
@@ -48,15 +48,58 @@ const columnVisibility = {
 let app;
 let socket;
 
+function getOrderIdCandidates(data) {
+  const candidates = [];
+  const txHash = data?.tx_hash || '';
+  const orderHash = data?.order_hash || '';
+  const hasLogIndex = data?.log_index !== undefined && data?.log_index !== null && data?.log_index !== '';
+  const logIndex = hasLogIndex ? data.log_index : '';
+  const hasBlock = data?.block_number !== undefined && data?.block_number !== null && data?.block_number !== '';
+  const blockNumber = hasBlock ? data.block_number : '';
+
+  // Legacy/current key formats (kept for backward compatibility with existing rows in DOM/map)
+  if (hasLogIndex && txHash) candidates.push(`${txHash}_${logIndex}`);
+  if (hasLogIndex && orderHash) candidates.push(`${orderHash}_${logIndex}`);
+  if (hasLogIndex && blockNumber !== '') candidates.push(`${blockNumber}_${logIndex}`);
+  if (hasLogIndex) candidates.push(`_${logIndex}`); // Existing rows created before tx_hash arrives
+
+  // Fallbacks when log index is not available
+  if (txHash) candidates.push(txHash);
+  if (orderHash) candidates.push(orderHash);
+
+  // Unique, non-empty
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function getPrimaryOrderId(data) {
+  const candidates = getOrderIdCandidates(data);
+  if (candidates.length > 0) return candidates[0];
+  return `temp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function findExistingOrderId(data) {
+  const candidates = getOrderIdCandidates(data);
+  return candidates.find((id) => ordersMap.has(id)) || null;
+}
+
 // Format functions
-function formatTimeWithMs(date) {
+const UTC_PLUS_8_OFFSET_HOURS = 8;
+
+function convertToUtcPlus8(date) {
+  // date.getTime() is already UTC epoch milliseconds.
+  // Shift by +8h and render with UTC getters for fixed Singapore display.
+  return new Date(date.getTime() + (UTC_PLUS_8_OFFSET_HOURS * 60 * 60 * 1000));
+}
+
+function formatTimeWithMs(date, useUtcPlus8 = false) {
   if (!date || !(date instanceof Date) || isNaN(date.getTime())) {
     date = new Date();
   }
-  const hours = String(date.getHours()).padStart(2, '0');
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  const seconds = String(date.getSeconds()).padStart(2, '0');
-  const milliseconds = String(date.getMilliseconds()).padStart(3, '0');
+  const displayDate = useUtcPlus8 ? convertToUtcPlus8(date) : date;
+  const hours = String(useUtcPlus8 ? displayDate.getUTCHours() : displayDate.getHours()).padStart(2, '0');
+  const minutes = String(useUtcPlus8 ? displayDate.getUTCMinutes() : displayDate.getMinutes()).padStart(2, '0');
+  const seconds = String(useUtcPlus8 ? displayDate.getUTCSeconds() : displayDate.getSeconds()).padStart(2, '0');
+  const milliseconds = String(useUtcPlus8 ? displayDate.getUTCMilliseconds() : displayDate.getMilliseconds()).padStart(3, '0');
   return `${hours}:${minutes}:${seconds}.${milliseconds}`;
 }
 
@@ -66,6 +109,13 @@ function formatAddress(addr) {
 
 function formatHash(hash, start = 10, end = 8) {
   return hash ? `${hash.substring(0, start)}...${hash.substring(hash.length - end)}` : '-';
+}
+
+function formatTxHashLink(txHash) {
+  if (!txHash) return '-';
+  const shortHash = formatHash(txHash, 10, 8);
+  const url = `https://polygonscan.com/tx/${txHash}`;
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="tx-link">${shortHash}</a>`;
 }
 
 function extractLeague(marketSlug) {
@@ -304,6 +354,9 @@ window.setTimeFilter = function(filter) {
   // Close menu
   const menu = document.getElementById('time-filter-menu');
   if (menu) menu.style.display = 'none';
+
+  // Apply filter to the main transaction table
+  applyTimeFilterToMainTable();
   
   // Refresh all summaries
   loadPMSummary();
@@ -311,12 +364,46 @@ window.setTimeFilter = function(filter) {
   loadOppositePartiesSummary();
 };
 
+window.setGameSlugFilter = function(value) {
+  gameSlugFilter = (value || '').trim().toLowerCase();
+
+  // Apply filter to the main transaction table
+  applyTimeFilterToMainTable();
+
+  // Refresh all summaries/cards
+  loadPMSummary();
+  loadGameSummaries();
+  loadOppositePartiesSummary();
+};
+
+window.setCounterpartyFilter = function(value) {
+  counterpartyFilter = (value || '').trim().toLowerCase();
+  // Apply to main transaction table too
+  applyTimeFilterToMainTable();
+
+  // Keep summaries/cards in sync with active filters
+  loadPMSummary();
+  loadGameSummaries();
+  loadOppositePartiesSummary();
+};
+
 // Filter orders by time range
-function getFilteredOrders() {
-  const allOrders = Array.from(ordersMap.values());
-  
+function getOrderTimestampMs(order) {
+  if (order && order.timestamp) {
+    return order.timestamp * 1000;
+  }
+  if (order && order.received_at) {
+    const receivedMs = new Date(order.received_at).getTime();
+    if (!Number.isNaN(receivedMs)) {
+      return receivedMs;
+    }
+  }
+  return null;
+}
+
+function isOrderInCurrentTimeFilter(order) {
   if (timeFilter === 'all') {
-    return allOrders;
+    return true;
   }
   
   const now = Date.now();
@@ -329,18 +416,47 @@ function getFilteredOrders() {
   
   const hours = hoursMap[timeFilter] || 24;
   const cutoffTime = now - (hours * 60 * 60 * 1000);
-  
-  return allOrders.filter(order => {
-    // Use timestamp if available (in seconds), convert to milliseconds
-    const orderTime = order.timestamp ? order.timestamp * 1000 : null;
-    if (!orderTime) {
-      // Fallback to received_at if timestamp not available
-      const receivedTime = order.received_at ? new Date(order.received_at).getTime() : null;
-      if (!receivedTime) return false;
-      return receivedTime >= cutoffTime;
-    }
-    return orderTime >= cutoffTime;
+  const orderTime = getOrderTimestampMs(order);
+  if (!orderTime) return false;
+  return orderTime >= cutoffTime;
+}
+
+function isOrderInCurrentGameSlugFilter(order) {
+  if (!gameSlugFilter) return true;
+  const slug = (order?.market_slug || '').toLowerCase();
+  return slug.includes(gameSlugFilter);
+}
+
+function isOrderInCurrentCounterpartyFilter(order) {
+  if (!counterpartyFilter) return true;
+  const user = (order?.user || '').toLowerCase();
+  const taker = (order?.taker || '').toLowerCase();
+  return user.includes(counterpartyFilter) || taker.includes(counterpartyFilter);
+}
+
+function isOrderVisibleByFilters(order) {
+  return (
+    isOrderInCurrentTimeFilter(order) &&
+    isOrderInCurrentGameSlugFilter(order) &&
+    isOrderInCurrentCounterpartyFilter(order)
+  );
+}
+
+function applyTimeFilterToMainTable() {
+  const tableBody = document.getElementById('orders-table');
+  if (!tableBody) return;
+
+  const rows = tableBody.querySelectorAll('tr[data-order-id]');
+  rows.forEach((row) => {
+    const orderId = row.getAttribute('data-order-id');
+    const order = ordersMap.get(orderId);
+    row.style.display = isOrderVisibleByFilters(order) ? '' : 'none';
   });
+}
+
+function getFilteredOrders() {
+  const allOrders = Array.from(ordersMap.values());
+  return allOrders.filter(isOrderVisibleByFilters);
 }
 
 function formatSportbook(sportbookData) {
@@ -357,6 +473,26 @@ const DEFAULT_PARTIES_TO_SHOW = 10;
 
 // Time filter state
 let timeFilter = 'all'; // '3h', '8h', '12h', '24h', 'all'
+let gameSlugFilter = ''; // free text, case-insensitive
+let counterpartyFilter = ''; // free text, case-insensitive
+let showGameCards = false;
+
+function applyGameCardsVisibility() {
+  const gameContainer = document.getElementById('game-summaries-container');
+  const toggleBtn = document.getElementById('toggle-game-cards-btn');
+
+  if (gameContainer) {
+    gameContainer.style.display = showGameCards ? 'block' : 'none';
+  }
+  if (toggleBtn) {
+    toggleBtn.textContent = showGameCards ? 'Hide Game Cards' : 'Show Game Cards';
+  }
+}
+
+window.toggleGameCardsSection = function() {
+  showGameCards = !showGameCards;
+  applyGameCardsVisibility();
+};
 
 // Calculate and display game summaries
 async function loadGameSummaries() {
@@ -646,7 +782,7 @@ async function loadGameSummaries() {
           ${enrichedTakers.length > 0 ? `
             <div style="margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid #e5e7eb;">
               <div style="font-weight: 600; color: #111827; margin-bottom: 0.875rem; font-size: 0.8125rem; text-transform: uppercase; letter-spacing: 0.025em;">Top 3 Takers by Volume</div>
-              <div style="display: grid; grid-template-columns: repeat(${enrichedTakers.length}, 1fr); gap: 0.75rem;">
+              <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem;">
                 ${enrichedTakers.map((taker, idx) => {
                   const polymarketUrl = `https://polymarket.com/${taker.address}`;
                   const pm = taker.polymarket || {};
@@ -655,11 +791,11 @@ async function loadGameSummaries() {
                   const verified = pm.verified_badge;
                   
                   return `
-                    <div style="background: #f9fafb; border-radius: 6px; padding: 0.875rem; border: 1px solid #e5e7eb;">
-                      <div style="font-weight: 600; color: #111827; margin-bottom: 0.625rem; font-size: 0.8125rem;">
+                    <div style="background: #f9fafb; border-radius: 6px; padding: 0.875rem; border: 1px solid #e5e7eb; min-width: 0; overflow: hidden;">
+                      <div style="font-weight: 600; color: #111827; margin-bottom: 0.625rem; font-size: 0.8125rem; line-height: 1.35; min-width: 0; overflow-wrap: anywhere; word-break: break-word;">
                         #${idx + 1} ${displayName ? `
                           <a href="${polymarketUrl}" target="_blank" rel="noopener noreferrer" 
-                             style="color: #3b82f6; text-decoration: none; font-weight: 600;"
+                             style="color: #3b82f6; text-decoration: none; font-weight: 600; display: inline-block; max-width: 100%; overflow-wrap: anywhere; word-break: break-word;"
                              onmouseover="this.style.textDecoration='underline'" 
                              onmouseout="this.style.textDecoration='none'">
                             ${displayName}
@@ -667,13 +803,13 @@ async function loadGameSummaries() {
                           ${verified ? '<span style="color: #10b981; font-size: 0.75rem; margin-left: 0.25rem;">✓</span>' : ''}
                         ` : `
                           <a href="${polymarketUrl}" target="_blank" rel="noopener noreferrer" 
-                             style="color: #3b82f6; text-decoration: none; font-family: monospace;"
+                             style="color: #3b82f6; text-decoration: none; font-family: monospace; display: inline-block; max-width: 100%; overflow-wrap: anywhere; word-break: break-all;"
                              onmouseover="this.style.textDecoration='underline'" 
                              onmouseout="this.style.textDecoration='none'">${formatAddress(taker.address)}</a>
                         `}
                       </div>
                       ${pseudonym ? `
-                        <div style="font-size: 0.75rem; color: #6b7280; margin-bottom: 0.375rem;">
+                        <div style="font-size: 0.75rem; color: #6b7280; margin-bottom: 0.375rem; overflow-wrap: anywhere; word-break: break-word;">
                           @${pseudonym}
                         </div>
                       ` : ''}
@@ -955,10 +1091,30 @@ async function loadOppositePartiesSummary() {
       container.innerHTML = '<div style="text-align: center; padding: 2rem; color: var(--text-secondary);">No opposite parties data available</div>';
       return;
     }
+
+    // Apply counterparty contains-filter (address / name / pseudonym)
+    const filteredParties = !counterpartyFilter
+      ? parties
+      : parties.filter((party) => {
+          const address = (party.address || '').toLowerCase();
+          const pm = party.polymarket || {};
+          const name = (pm.name || '').toLowerCase();
+          const pseudonym = (pm.pseudonym || '').toLowerCase();
+          return (
+            address.includes(counterpartyFilter) ||
+            name.includes(counterpartyFilter) ||
+            pseudonym.includes(counterpartyFilter)
+          );
+        });
+
+    if (filteredParties.length === 0) {
+      container.innerHTML = `<div style="text-align: center; padding: 2rem; color: var(--text-secondary);">No counterparties match "${counterpartyFilter}"</div>`;
+      return;
+    }
     
     // Determine how many parties to show
-    const partiesToShow = showAllParties ? parties.length : Math.min(DEFAULT_PARTIES_TO_SHOW, parties.length);
-    const hasMore = parties.length > DEFAULT_PARTIES_TO_SHOW;
+    const partiesToShow = showAllParties ? filteredParties.length : Math.min(DEFAULT_PARTIES_TO_SHOW, filteredParties.length);
+    const hasMore = filteredParties.length > DEFAULT_PARTIES_TO_SHOW;
 
     // Create table with header - improved design
     let tableHTML = `
@@ -967,10 +1123,10 @@ async function loadOppositePartiesSummary() {
           <span style="font-size: 1.25rem;">🏆</span>
           <div>
             <div style="font-size: 1.125rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.25rem;">
-              Top ${parties.length} Counterparties
+              Top ${filteredParties.length} Counterparties
             </div>
             <div style="font-size: 0.875rem; color: var(--text-secondary);">
-              Showing ${partiesToShow} of ${parties.length} counterparties
+              Showing ${partiesToShow} of ${filteredParties.length} counterparties${counterpartyFilter ? ` (filtered from ${parties.length})` : ''}
             </div>
           </div>
         </div>
@@ -1004,7 +1160,7 @@ async function loadOppositePartiesSummary() {
         <tbody>
     `;
 
-    parties.slice(0, partiesToShow).forEach((party, index) => {
+    filteredParties.slice(0, partiesToShow).forEach((party, index) => {
       const profitSign = party.profit >= 0 ? '+' : '';
       const pm = party.polymarket || {};
       
@@ -1173,7 +1329,7 @@ async function loadOrdersFromBackend() {
 
     // Process each order (oldest first, so insertBefore puts newest at top)
     ordersReversed.forEach(order => {
-      const orderId = `${order.tx_hash}_${order.log_index}`;
+      const orderId = getPrimaryOrderId(order);
       if (!ordersMap.has(orderId)) {
         // Debug: Check if PM data is present
         const hasBefore = order.polymarket_before !== undefined && order.polymarket_before !== null;
@@ -1217,39 +1373,53 @@ async function loadOrdersFromBackend() {
 // Handle order updates
 function handleOrderUpdate(data, skipStats = false) {
   try {
-    // Create unique order ID
-    const orderId = `${data.tx_hash}_${data.log_index}`;
+    // Create stable order ID (supports tx_hash appearing later)
+    const nextOrderId = getPrimaryOrderId(data);
+    const existingOrderId = findExistingOrderId(data);
+    const orderId = existingOrderId || nextOrderId;
     
     // Check if this is an update to existing order
-    const isUpdate = ordersMap.has(orderId);
+    const isUpdate = !!existingOrderId;
     
     if (isUpdate) {
       // Update existing order in the table
-      const existingRow = document.querySelector(`[data-order-id="${orderId}"]`);
+      const existingRow = document.querySelector(`[data-order-id="${existingOrderId}"]`);
       if (existingRow) {
-        const cells = existingRow.querySelectorAll('td');
-        // PM Before is at index 19, PM After at index 20, Sportbook at index 21
-        // Always keep details minimized (collapsed) when updating
+        // If we now have a stronger ID (e.g. tx_hash arrived), migrate row ID
+        if (nextOrderId !== existingOrderId) {
+          existingRow.setAttribute('data-order-id', nextOrderId);
+        }
+        // Always target by data-column (safer than fixed indexes)
+        const txHashCell = existingRow.querySelector('td[data-column="tx-hash"]');
+        const pmBeforeCell = existingRow.querySelector('td[data-column="pm-before"]');
+        const pmAfterCell = existingRow.querySelector('td[data-column="pm-after"]');
+        const pmSportbookCell = existingRow.querySelector('td[data-column="pm-sportbook"]');
+
+        if (txHashCell) {
+          txHashCell.innerHTML = formatTxHashLink(data.tx_hash);
+        }
         
-        if (cells[19]) {
-          cells[19].innerHTML = formatPolymarketPercentage(data.price, data.polymarket_before, 'BEFORE', orderId);
+        if (pmBeforeCell) {
+          pmBeforeCell.innerHTML = formatPolymarketPercentage(data.price, data.polymarket_before, 'BEFORE', orderId);
           // Ensure details are collapsed (minimized) by default
           const expandedEl = document.getElementById(`pm-before-${orderId}`);
           if (expandedEl) expandedEl.style.display = 'none';
           // Reset toggle icon to collapsed state
-          const toggleEl = cells[19].querySelector('.pm-toggle');
+          const toggleEl = pmBeforeCell.querySelector('.pm-toggle');
           if (toggleEl) toggleEl.textContent = '▶';
         }
-        if (cells[20]) {
-          cells[20].innerHTML = formatPolymarketPercentage(data.price, data.polymarket_after, 'AFTER', orderId);
+        if (pmAfterCell) {
+          pmAfterCell.innerHTML = formatPolymarketPercentage(data.price, data.polymarket_after, 'AFTER', orderId);
           // Ensure details are collapsed (minimized) by default
           const expandedEl = document.getElementById(`pm-after-${orderId}`);
           if (expandedEl) expandedEl.style.display = 'none';
           // Reset toggle icon to collapsed state
-          const toggleEl = cells[20].querySelector('.pm-toggle');
+          const toggleEl = pmAfterCell.querySelector('.pm-toggle');
           if (toggleEl) toggleEl.textContent = '▶';
         }
-        if (cells[21]) cells[21].textContent = formatSportbook(data.sportbook);
+        if (pmSportbookCell) {
+          pmSportbookCell.textContent = formatSportbook(data.sportbook);
+        }
         
         // Highlight the row to show it was updated
         existingRow.classList.add('new-row');
@@ -1257,7 +1427,15 @@ function handleOrderUpdate(data, skipStats = false) {
       }
       
       // Update the order data in map (backend handles persistence)
-      ordersMap.set(orderId, data);
+      if (nextOrderId !== existingOrderId) {
+        ordersMap.delete(existingOrderId);
+      }
+      ordersMap.set(nextOrderId, data);
+      
+      // Keep main table row visibility in sync with selected time filter
+      if (existingRow) {
+        existingRow.style.display = isOrderVisibleByFilters(data) ? '' : 'none';
+      }
       
       // Debounce summary updates to avoid too many refreshes
       if (summaryUpdateTimer) clearTimeout(summaryUpdateTimer);
@@ -1312,7 +1490,7 @@ function handleOrderUpdate(data, skipStats = false) {
     } else {
       receivedDate = new Date();
     }
-    const receivedTimeStr = formatTimeWithMs(receivedDate);
+    const receivedTimeStr = formatTimeWithMs(receivedDate, true);
 
     // Calculate value
     const value = ((data.shares_normalized || 0) * (data.price || 0)).toFixed(2);
@@ -1320,7 +1498,7 @@ function handleOrderUpdate(data, skipStats = false) {
     // Create row
     const row = document.createElement('tr');
     row.className = 'new-row';
-    row.setAttribute('data-order-id', orderId);
+    row.setAttribute('data-order-id', nextOrderId);
     row.innerHTML = `
       <td data-column="date" class="timestamp">${orderDateStr}</td>
       <td data-column="order-time" class="timestamp">${orderTimeStr}</td>
@@ -1341,7 +1519,7 @@ function handleOrderUpdate(data, skipStats = false) {
       <td data-column="user" class="address">${formatAddress(data.user)}</td>
       <td data-column="taker" class="address">${formatAddress(data.taker)}</td>
       <td data-column="order-hash" class="address">${formatHash(data.order_hash, 10, 8)}</td>
-      <td data-column="tx-hash" class="address">${formatHash(data.tx_hash, 10, 8)}</td>
+      <td data-column="tx-hash" class="address">${formatTxHashLink(data.tx_hash)}</td>
       <td data-column="pm-before" class="pm-cell">${formatPolymarketPercentage(data.price, data.polymarket_before, 'BEFORE', orderId)}</td>
       <td data-column="pm-after" class="pm-cell">${formatPolymarketPercentage(data.price, data.polymarket_after, 'AFTER', orderId)}</td>
       <td data-column="pm-sportbook" class="number">${formatSportbook(data.sportbook)}</td>
@@ -1349,6 +1527,8 @@ function handleOrderUpdate(data, skipStats = false) {
     
     // Apply column visibility
     applyColumnVisibility(row);
+    // Apply current time filter visibility for the new row
+    row.style.display = isOrderVisibleByFilters(data) ? '' : 'none';
 
     // Add to table - ensure DOM is ready
     const tableBody = document.getElementById('orders-table');
@@ -1368,7 +1548,7 @@ function handleOrderUpdate(data, skipStats = false) {
     }
     
     // Store in map FIRST (before DOM update) - backend handles persistence
-    ordersMap.set(orderId, data);
+    ordersMap.set(nextOrderId, data);
 
     // Use requestAnimationFrame for smooth DOM updates
     requestAnimationFrame(() => {
@@ -1423,42 +1603,72 @@ function createUI() {
   app.innerHTML = `
     <div class="container">
       <div class="header">
-        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1.5rem; gap: 2rem;">
+        <div style="display: flex; align-items: flex-start; margin-bottom: 1.5rem; gap: 2rem;">
           <div style="flex: 1;">
             <h1 style="margin: 0 0 1rem 0; display: flex; align-items: center; gap: 1rem;">
               TRADES HISTORY and CounterParties
               <span id="status" class="status disconnected">Disconnected</span>
             </h1>
-            <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
-              <div class="time-filter-container" style="position: relative; z-index: 100;">
-                <label style="font-weight: 500; color: var(--text-primary); margin-right: 0.5rem; font-size: 0.875rem;">Time Filter:</label>
-                <button id="time-filter-btn" class="time-filter-btn" onclick="toggleTimeFilterMenu(event)" style="background: white; border: 1px solid var(--border-color); border-radius: 6px; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.875rem; color: var(--text-primary); font-weight: 500; min-width: 140px; text-align: left; position: relative; display: flex; align-items: center; justify-content: space-between; z-index: 101;">
-                  <span id="time-filter-label">All Time</span>
-                  <span style="margin-left: 0.5rem;">▼</span>
-                </button>
-                <div id="time-filter-menu" class="time-filter-menu" style="display: none; position: absolute; top: 100%; left: 0; margin-top: 0.25rem; background: #1f2937; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); z-index: 1002; min-width: 160px; padding: 0.5rem 0; border: 1px solid #374151;">
-                  <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('3h');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; color: #e5e7eb; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; transition: background 0.2s; pointer-events: auto;" onmouseover="this.style.background='#374151'" onmouseout="this.style.background='transparent'">
-                    <span id="time-filter-check-3h" style="display: none; color: white;">✓</span>
-                    <span>Last 3 Hours</span>
-                  </div>
-                  <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('8h');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; color: #e5e7eb; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; transition: background 0.2s; pointer-events: auto;" onmouseover="this.style.background='#374151'" onmouseout="this.style.background='transparent'">
-                    <span id="time-filter-check-8h" style="display: none; color: white;">✓</span>
-                    <span>Last 8 Hours</span>
-                  </div>
-                  <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('12h');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; color: #e5e7eb; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; transition: background 0.2s; pointer-events: auto;" onmouseover="this.style.background='#374151'" onmouseout="this.style.background='transparent'">
-                    <span id="time-filter-check-12h" style="display: none; color: white;">✓</span>
-                    <span>Last 12 Hours</span>
-                  </div>
-                  <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('24h');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; color: #e5e7eb; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; transition: background 0.2s; pointer-events: auto;" onmouseover="this.style.background='#374151'" onmouseout="this.style.background='transparent'">
-                    <span id="time-filter-check-24h" style="display: none; color: white;">✓</span>
-                    <span>Last 24 Hours</span>
-                  </div>
-                  <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('all');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; background: #3b82f6; color: white; font-size: 0.875rem; font-weight: 500; margin-top: 0.25rem; border-top: 1px solid #4b5563; border-radius: 0 0 8px 8px; pointer-events: auto;">
-                    <span>All Time</span>
-                  </div>
-                </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Order: 1. Counterparties, 2. PM Summary, 3. Game Summaries, 4. Transaction Table -->
+      <div class="opposite-parties-summary" id="opposite-parties-summary" style="margin-bottom: 2rem; width: 100%; clear: both; display: block;">
+        <div id="opposite-parties-table-container">
+          <div class="loading">Loading opposite parties data...</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 1rem;">
+          <div class="time-filter-container" style="position: relative; z-index: 100;">
+            <label style="font-weight: 500; color: var(--text-primary); margin-right: 0.5rem; font-size: 0.875rem;">Time Filter:</label>
+            <span class="timezone-chip">Received time shown in UTC+8 (Singapore)</span>
+            <button id="time-filter-btn" class="time-filter-btn" onclick="toggleTimeFilterMenu(event)" style="background: white; border: 1px solid var(--border-color); border-radius: 6px; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.875rem; color: var(--text-primary); font-weight: 500; min-width: 140px; text-align: left; position: relative; display: flex; align-items: center; justify-content: space-between; z-index: 101;">
+              <span id="time-filter-label">All Time</span>
+              <span style="margin-left: 0.5rem;">▼</span>
+            </button>
+            <div id="time-filter-menu" class="time-filter-menu" style="display: none; position: absolute; top: 100%; left: 0; margin-top: 0.25rem; background: #ffffff; border-radius: 8px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.15); z-index: 1002; min-width: 180px; padding: 0.5rem 0; border: 1px solid #dbe6f3;">
+              <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('3h');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; color: #334155; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; transition: background 0.2s; pointer-events: auto;" onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='transparent'">
+                <span id="time-filter-check-3h" style="display: none; color: white;">✓</span>
+                <span>Last 3 Hours</span>
               </div>
-            <div class="column-toggle-container">
+              <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('8h');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; color: #334155; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; transition: background 0.2s; pointer-events: auto;" onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='transparent'">
+                <span id="time-filter-check-8h" style="display: none; color: white;">✓</span>
+                <span>Last 8 Hours</span>
+              </div>
+              <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('12h');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; color: #334155; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; transition: background 0.2s; pointer-events: auto;" onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='transparent'">
+                <span id="time-filter-check-12h" style="display: none; color: white;">✓</span>
+                <span>Last 12 Hours</span>
+              </div>
+              <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('24h');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; color: #334155; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; transition: background 0.2s; pointer-events: auto;" onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='transparent'">
+                <span id="time-filter-check-24h" style="display: none; color: white;">✓</span>
+                <span>Last 24 Hours</span>
+              </div>
+              <div class="time-filter-option" onclick="(function(e){e.stopPropagation(); setTimeFilter('all');})(event)" style="padding: 0.625rem 1rem; cursor: pointer; background: #e8f1ff; color: #1d4ed8; font-size: 0.875rem; font-weight: 600; margin-top: 0.25rem; border-top: 1px solid #dbe6f3; border-radius: 0 0 8px 8px; pointer-events: auto;">
+                <span>All Time</span>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <label for="game-slug-filter-input" style="font-weight: 500; color: var(--text-primary); font-size: 0.875rem;">Game Slug:</label>
+            <input
+              id="game-slug-filter-input"
+              type="text"
+              placeholder="e.g. nba-uta"
+              oninput="setGameSlugFilter(this.value)"
+              style="height: 38px; min-width: 200px; padding: 0.5rem 0.75rem; border: 1px solid var(--border-color); border-radius: 8px; font-size: 0.875rem; color: var(--text-primary); background: white; outline: none;"
+            />
+          </div>
+          <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <label for="counterparty-filter-input" style="font-weight: 500; color: var(--text-primary); font-size: 0.875rem;">Counterparty:</label>
+            <input
+              id="counterparty-filter-input"
+              type="text"
+              placeholder="e.g. 0xcb or 5f7"
+              oninput="setCounterpartyFilter(this.value)"
+              style="height: 38px; min-width: 220px; padding: 0.5rem 0.75rem; border: 1px solid var(--border-color); border-radius: 8px; font-size: 0.875rem; color: var(--text-primary); background: white; outline: none;"
+            />
+          </div>
+          <div class="column-toggle-container">
             <button class="column-toggle-btn" onclick="toggleColumnMenu()">
               Show/Hide Columns
             </button>
@@ -1467,7 +1677,7 @@ function createUI() {
               <div class="column-menu-content">
                 <label><input type="checkbox" data-column="date" ${columnVisibility['date'] ? 'checked' : ''} onchange="toggleColumn('date', this.checked)"> Date</label>
                 <label><input type="checkbox" data-column="order-time" ${columnVisibility['order-time'] ? 'checked' : ''} onchange="toggleColumn('order-time', this.checked)"> Order Time</label>
-                <label><input type="checkbox" data-column="received-at" ${columnVisibility['received-at'] ? 'checked' : ''} onchange="toggleColumn('received-at', this.checked)"> Received At</label>
+                <label><input type="checkbox" data-column="received-at" ${columnVisibility['received-at'] ? 'checked' : ''} onchange="toggleColumn('received-at', this.checked)"> Received At (UTC+8)</label>
                 <label><input type="checkbox" data-column="side" ${columnVisibility['side'] ? 'checked' : ''} onchange="toggleColumn('side', this.checked)"> Side</label>
                 <label><input type="checkbox" data-column="league" ${columnVisibility['league'] ? 'checked' : ''} onchange="toggleColumn('league', this.checked)"> League</label>
                 <label><input type="checkbox" data-column="title" ${columnVisibility['title'] ? 'checked' : ''} onchange="toggleColumn('title', this.checked)"> Title</label>
@@ -1491,32 +1701,11 @@ function createUI() {
               </div>
             </div>
           </div>
+          <div class="column-toggle-container">
+            <button id="toggle-game-cards-btn" class="column-toggle-btn" onclick="toggleGameCardsSection()">
+              Hide Game Cards
+            </button>
           </div>
-          <div class="stats" style="display: flex; flex-direction: column; gap: 0.75rem; min-width: 200px; flex-shrink: 0;">
-            <div class="stat" style="background: var(--bg-secondary); padding: 0.875rem 1rem; border-radius: 8px; border: 1px solid var(--border-color);">
-              <div class="stat-label" style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 0.05em;">Total Orders</div>
-              <div class="stat-value" id="total-orders" style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">0</div>
-            </div>
-            <div class="stat" style="background: var(--bg-secondary); padding: 0.875rem 1rem; border-radius: 8px; border: 1px solid var(--border-color);">
-              <div class="stat-label" style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 0.05em;">Buy Orders</div>
-              <div class="stat-value" id="buy-orders" style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">0</div>
-            </div>
-            <div class="stat" style="background: var(--bg-secondary); padding: 0.875rem 1rem; border-radius: 8px; border: 1px solid var(--border-color);">
-              <div class="stat-label" style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 0.05em;">Sell Orders</div>
-              <div class="stat-value" id="sell-orders" style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">0</div>
-            </div>
-            <div class="stat" style="background: var(--bg-secondary); padding: 0.875rem 1rem; border-radius: 8px; border: 1px solid var(--border-color);">
-              <div class="stat-label" style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 0.05em;">Total Volume</div>
-              <div class="stat-value" id="total-volume" style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">$0.00</div>
-            </div>
-          </div>
-        </div>
-      </div>
-      
-      <!-- Order: 1. Counterparties, 2. PM Summary, 3. Game Summaries, 4. Transaction Table -->
-      <div class="opposite-parties-summary" id="opposite-parties-summary" style="margin-bottom: 2rem; width: 100%; clear: both; display: block;">
-        <div id="opposite-parties-table-container">
-          <div class="loading">Loading opposite parties data...</div>
         </div>
       </div>
       
@@ -1534,7 +1723,7 @@ function createUI() {
             <tr>
               <th data-column="date">Date</th>
               <th data-column="order-time">Order Time</th>
-              <th data-column="received-at">Received At</th>
+              <th data-column="received-at">Received At (UTC+8)</th>
               <th data-column="side">Side</th>
               <th data-column="league">League</th>
               <th data-column="title">Title</th>
@@ -1595,6 +1784,7 @@ function createUI() {
     
     // Initialize time filter UI
     setTimeFilter('all');
+    applyGameCardsVisibility();
   }, 100);
 }
 

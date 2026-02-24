@@ -76,6 +76,7 @@ pending_updates = {}  # Track orders waiting for delayed updates
 # Order history storage (in-memory, 48 hours retention)
 order_history = []  # List of order dicts
 MAX_ORDER_AGE_HOURS = 48
+MAX_ORDER_HISTORY = 4000
 
 # Batching and worker pool for high-frequency updates
 order_queue = None  # Will be initialized in lifespan
@@ -466,6 +467,26 @@ async def enrich_takers(addresses: str):
         traceback.print_exc()
         return {"takers": [], "error": str(e)}
 
+def _get_order_time_for_retention(order: dict) -> float:
+    """Return epoch seconds for retention checks, preferring received_at."""
+    received_at = order.get('received_at')
+    if received_at:
+        try:
+            parsed = datetime.fromisoformat(str(received_at).replace('Z', '+00:00'))
+            return parsed.timestamp()
+        except Exception:
+            pass
+    
+    raw_timestamp = order.get('timestamp', 0)
+    try:
+        ts = float(raw_timestamp)
+        # Normalize milliseconds to seconds if needed
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return ts
+    except Exception:
+        return 0.0
+
 def cleanup_old_orders():
     """Remove orders older than 48 hours"""
     global order_history
@@ -477,7 +498,7 @@ def cleanup_old_orders():
     
     order_history = [
         order for order in order_history
-        if order.get('timestamp', 0) > cutoff_time
+        if _get_order_time_for_retention(order) > cutoff_time
     ]
     
     removed = initial_count - len(order_history)
@@ -725,6 +746,9 @@ def store_order_in_history(order_data: dict):
     """Store order in history, updating if exists"""
     global order_history
     
+    # Keep memory healthy by pruning stale orders before each write
+    cleanup_old_orders()
+    
     order_id = f"{order_data.get('tx_hash')}_{order_data.get('log_index')}"
     
     # Check if order already exists
@@ -753,12 +777,12 @@ def store_order_in_history(order_data: dict):
         if has_before or has_after or has_sportbook:
             print(f"💾 Added order {order_id} to history - PM Before: {has_before}, PM After: {has_after}, Sportbook: {has_sportbook}")
     
-    # Sort by timestamp (newest first)
-    order_history.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+    # Sort by received/order time (newest first)
+    order_history.sort(key=_get_order_time_for_retention, reverse=True)
     
-    # Limit to reasonable size (keep last 1000 orders max)
-    if len(order_history) > 1000:
-        order_history = order_history[:1000]
+    # Limit history size (keep last 4000 orders max)
+    if len(order_history) > MAX_ORDER_HISTORY:
+        order_history = order_history[:MAX_ORDER_HISTORY]
 
 async def get_polymarket_bbo_after(market_slug: str, token_label: str, fill_timestamp: int):
     """Get Polymarket After BBO data - match by market_slug and token_label"""
