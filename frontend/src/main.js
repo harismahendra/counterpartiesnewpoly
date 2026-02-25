@@ -397,6 +397,14 @@ window.setCounterpartyFilter = function(value) {
   loadOppositePartiesSummary();
 };
 
+window.setUserFilter = function(value) {
+  userFilter = (value || '').trim().toLowerCase();
+  applyTimeFilterToMainTable();
+  loadPMSummary();
+  loadGameSummaries();
+  loadOppositePartiesSummary();
+};
+
 // Filter orders by time range
 function getOrderTimestampMs(order) {
   if (order && order.timestamp) {
@@ -444,11 +452,18 @@ function isOrderInCurrentCounterpartyFilter(order) {
   return user.includes(counterpartyFilter) || taker.includes(counterpartyFilter);
 }
 
+function isOrderInCurrentUserFilter(order) {
+  if (!userFilter) return true;
+  const user = (order?.user || '').toLowerCase();
+  return user.includes(userFilter);
+}
+
 function isOrderVisibleByFilters(order) {
   return (
     isOrderInCurrentTimeFilter(order) &&
     isOrderInCurrentGameSlugFilter(order) &&
-    isOrderInCurrentCounterpartyFilter(order)
+    isOrderInCurrentCounterpartyFilter(order) &&
+    isOrderInCurrentUserFilter(order)
   );
 }
 
@@ -485,6 +500,7 @@ const DEFAULT_PARTIES_TO_SHOW = 10;
 let timeFilter = 'all'; // '3h', '8h', '12h', '24h', 'all'
 let gameSlugFilter = ''; // free text, case-insensitive
 let counterpartyFilter = ''; // free text, case-insensitive
+let userFilter = ''; // free text, case-insensitive
 let showGameCards = false;
 
 function applyGameCardsVisibility() {
@@ -1080,7 +1096,11 @@ function loadPMSummary() {
 async function loadOppositePartiesSummary() {
   try {
     console.log('📊 Loading opposite parties summary...');
-    const response = await fetch(`${BACKEND_URL}/api/orders/opposite-parties`);
+    const url = new URL(`${BACKEND_URL}/api/orders/opposite-parties`);
+    if (userFilter) {
+      url.searchParams.set('user_filter', userFilter);
+    }
+    const response = await fetch(url.toString());
     if (!response.ok) {
       console.error('❌ Failed to load opposite parties summary:', response.statusText);
       return;
@@ -1675,6 +1695,16 @@ function createUI() {
               type="text"
               placeholder="e.g. 0xcb or 5f7"
               oninput="setCounterpartyFilter(this.value)"
+              style="height: 38px; min-width: 220px; padding: 0.5rem 0.75rem; border: 1px solid var(--border-color); border-radius: 8px; font-size: 0.875rem; color: var(--text-primary); background: white; outline: none;"
+            />
+          </div>
+          <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <label for="user-filter-input" style="font-weight: 500; color: var(--text-primary); font-size: 0.875rem;">User:</label>
+            <input
+              id="user-filter-input"
+              type="text"
+              placeholder="e.g. 0x9d94"
+              oninput="setUserFilter(this.value)"
               style="height: 38px; min-width: 220px; padding: 0.5rem 0.75rem; border: 1px solid var(--border-color); border-radius: 8px; font-size: 0.875rem; color: var(--text-primary); background: white; outline: none;"
             />
           </div>

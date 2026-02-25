@@ -284,7 +284,7 @@ async def get_order_history():
         return {"orders": [], "count": 0, "error": str(e)}
 
 @app.get("/api/orders/opposite-parties")
-async def get_opposite_parties_summary():
+async def get_opposite_parties_summary(user_filter: Optional[str] = None):
     """Get summary of opposite parties (taker/maker addresses not in our wallet list)"""
     try:
         # Clean up old orders first
@@ -293,6 +293,9 @@ async def get_opposite_parties_summary():
         # Normalize wallet addresses for comparison (lowercase)
         our_wallets = {addr.lower() for addr in WALLET_ADDRESSES}
         
+        # Optional filter by user column (case-insensitive contains)
+        user_filter_norm = (user_filter or "").strip().lower()
+
         # Group orders by opposite party
         party_stats = {}  # {address: {'volume': 0, 'profit': 0, 'orders': 0, 'address': addr}}
         
@@ -300,6 +303,10 @@ async def get_opposite_parties_summary():
             # Get opposite party address (taker or maker that's not us)
             user_addr = order.get('user', '').lower() if order.get('user') else ''
             taker_addr = order.get('taker', '').lower() if order.get('taker') else ''
+
+            # Apply user filter first (only keep orders matching selected user)
+            if user_filter_norm and user_filter_norm not in user_addr:
+                continue
             
             # Determine opposite party
             opposite_party = None
