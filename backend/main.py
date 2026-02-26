@@ -89,6 +89,51 @@ db_semaphore = None  # Will be initialized in lifespan
 polymarket_cache = {}  # {address: {'data': {...}, 'expires_at': timestamp}}
 CACHE_DURATION = 3600  # 1 hour
 
+# Team mappings for Pinnacle deltas matching (from analyzer3.py approach)
+TEAM_MAPPINGS = {
+    'MLB': {
+        'mariners': 'SEA', 'rockies': 'COL', 'giants': 'SF', 'royals': 'KC',
+        'astros': 'HOU', 'orioles': 'BAL', 'mets': 'NYM', 'cardinals': 'STL',
+        'yankees': 'NYY', 'twins': 'MIN', 'tigers': 'DET', 'blue jays': 'TOR',
+        'pirates': 'PIT', 'guardians': 'CLE', 'white sox': 'CWS', 'red sox': 'BOS',
+        'brewers': 'MIL', 'braves': 'ATL', 'marlins': 'MIA', 'nationals': 'WSH',
+        'phillies': 'PHI', 'rangers': 'TEX', 'rays': 'TB', 'cubs': 'CHC',
+        'diamondbacks': 'ARI', 'dodgers': 'LAD', 'padres': 'SD', 'angels': 'LAA',
+        'athletics': 'OAK', 'reds': 'CIN',
+    },
+    'NFL': {
+        'eagles': 'PHI', 'cardinals': 'ARI', 'giants': 'NYG', 'falcons': 'ATL',
+        'panthers': 'CAR', 'bears': 'CHI', 'cowboys': 'DAL', 'lions': 'DET',
+        'packers': 'GB', 'rams': 'LAR', 'vikings': 'MIN', 'saints': 'NO',
+        '49ers': 'SF', 'seahawks': 'SEA', 'buccaneers': 'TB', 'commanders': 'WSH',
+        'ravens': 'BAL', 'bills': 'BUF', 'bengals': 'CIN', 'browns': 'CLE',
+        'broncos': 'DEN', 'texans': 'HOU', 'colts': 'IND', 'jaguars': 'JAX',
+        'chiefs': 'KC', 'chargers': 'LAC', 'dolphins': 'MIA', 'raiders': 'LV',
+        'patriots': 'NE', 'jets': 'NYJ', 'steelers': 'PIT', 'titans': 'TEN',
+    },
+    'NHL': {
+        'bruins': 'BOS', 'sabres': 'BUF', 'hurricanes': 'CAR', 'blue jackets': 'CBJ',
+        'flames': 'CGY', 'blackhawks': 'CHI', 'avalanche': 'COL', 'stars': 'DAL',
+        'red wings': 'DET', 'oilers': 'EDM', 'panthers': 'FLA', 'ducks': 'ANA',
+        'golden knights': 'VGK', 'kraken': 'SEA', 'blues': 'STL', 'lightning': 'TBL',
+        'mammoth': 'UTA', 'canucks': 'VAN', 'jets': 'WPG', 'capitals': 'WSH',
+        'wild': 'MIN', 'canadiens': 'MTL', 'devils': 'NJD', 'predators': 'NSH',
+        'islanders': 'NYI', 'rangers': 'NYR', 'senators': 'OTT', 'flyers': 'PHI',
+        'penguins': 'PIT', 'sharks': 'SJS', 'maple leafs': 'TOR', 'utah': 'UTA',
+        'kings': 'LAK',
+    },
+    'NBA': {
+        'hawks': 'ATL', 'celtics': 'BOS', 'nets': 'BKN', 'hornets': 'CHA',
+        'bulls': 'CHI', 'cavaliers': 'CLE', 'mavericks': 'DAL', 'nuggets': 'DEN',
+        'pistons': 'DET', 'rockets': 'HOU', 'pacers': 'IND', 'clippers': 'LAC',
+        'lakers': 'LAL', 'grizzlies': 'MEM', 'heat': 'MIA', 'bucks': 'MIL',
+        'timberwolves': 'MIN', 'pelicans': 'NOP', 'knicks': 'NYK', 'thunder': 'OKC',
+        'magic': 'ORL', '76ers': 'PHI', 'suns': 'PHX', 'trail blazers': 'POR',
+        'kings': 'SAC', 'spurs': 'SAS', 'raptors': 'TOR', 'jazz': 'UTA',
+        'warriors': 'GSW', 'wizards': 'WAS', 'pho': 'PHX',
+    },
+}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown"""
@@ -649,6 +694,237 @@ def get_poly_db_connection():
         traceback.print_exc()
         return None
 
+def normalize_league_name(league: str) -> Optional[str]:
+    if not league:
+        return None
+    league_upper = league.strip().upper()
+    league_map = {
+        'NBA': 'NBA',
+        'NFL': 'NFL',
+        'MLB': 'MLB',
+        'NHL': 'NHL',
+        'ATP': 'ATP',
+        'WTA': 'WTA',
+    }
+    return league_map.get(league_upper)
+
+def get_league_from_market_slug(market_slug: str) -> Optional[str]:
+    if not market_slug:
+        return None
+    parts = market_slug.split('-')
+    if not parts:
+        return None
+    return parts[0].upper()
+
+def get_pinnacle_db_connection():
+    """Create PostgreSQL database connection for Pinnacle deltas (DATABASE_URL)."""
+    database_url = os.getenv('DATABASE_URL')
+    if not database_url:
+        return None
+    try:
+        result = urlparse(database_url)
+        ssl_mode = None
+        if result.hostname and ('render.com' in result.hostname or 'amazonaws.com' in result.hostname):
+            ssl_mode = 'require'
+        return psycopg2.connect(
+            database=result.path[1:] if result.path else None,
+            user=result.username,
+            password=result.password,
+            host=result.hostname,
+            port=result.port,
+            connect_timeout=10,
+            cursor_factory=RealDictCursor,
+            sslmode=ssl_mode
+        )
+    except Exception as e:
+        print(f"⚠️  Error connecting to Pinnacle DB: {type(e).__name__}: {e}")
+        return None
+
+def get_deltas_team_name(fill_side: str, league: str) -> Optional[str]:
+    """Convert fill side to Deltas team abbreviation/name using analyzer3-style mappings."""
+    if not fill_side or not league:
+        return None
+    normalized_sport = normalize_league_name(league)
+    if not normalized_sport:
+        return None
+
+    fill_lower = str(fill_side).strip().lower()
+    league_teams = TEAM_MAPPINGS.get(normalized_sport, {})
+    mapped = league_teams.get(fill_lower)
+    if mapped:
+        return mapped
+
+    # Tennis fallback: preserve analyzer3 behavior (best-effort name matching).
+    if normalized_sport in ['ATP', 'WTA']:
+        words = fill_lower.split()
+        return ' '.join(word.capitalize() for word in words)
+    return None
+
+def _normalize_deltas_record(record: Dict, fill_timestamp_ms: int, relation: str) -> Dict:
+    bbo_price = float(record.get('bbo_price')) if record.get('bbo_price') is not None else None
+    ts_ms = float(record.get('timestamp_ms')) if record.get('timestamp_ms') is not None else None
+    seconds_from_fill = None
+    if ts_ms is not None:
+        if relation == 'before':
+            seconds_from_fill = round((fill_timestamp_ms - ts_ms) / 1000.0, 3)
+        else:
+            seconds_from_fill = round((ts_ms - fill_timestamp_ms) / 1000.0, 3)
+
+    ts_raw = record.get('timestamp')
+    timestamp_str = None
+    if isinstance(ts_raw, datetime):
+        timestamp_str = ts_raw.isoformat()
+    elif ts_raw is not None:
+        timestamp_str = str(ts_raw)
+
+    return {
+        'bbo': bbo_price,
+        'percentage': record.get('percentage'),
+        'total_spread': record.get('total_spread'),
+        'opponent_percentage': record.get('opponent_percentage'),
+        'team': record.get('team'),
+        'opposing_team': record.get('opposing_team'),
+        'seconds_from_fill': seconds_from_fill,
+        'timestamp': timestamp_str,
+        'source': 'pinnacle'
+    }
+
+def _get_pinnacle_bbo_sync(market_slug: str, token_label: str, fill_timestamp_ms: int, relation: str):
+    """Get Pinnacle before/after deltas using analyzer3-style matching."""
+    conn = None
+    cursor = None
+    try:
+        league = normalize_league_name(get_league_from_market_slug(market_slug))
+        if not league:
+            return None
+
+        team_name = get_deltas_team_name(token_label, league) or token_label
+        if not team_name:
+            return None
+
+        conn = get_pinnacle_db_connection()
+        if not conn:
+            return None
+        cursor = conn.cursor()
+
+        window_before_ms = 5 * 60 * 1000
+        window_after_ms = 5 * 60 * 1000
+        start_ms = fill_timestamp_ms - window_before_ms
+        end_ms = fill_timestamp_ms + window_after_ms
+        after_min_ms = fill_timestamp_ms + 10 * 1000
+
+        base_query = """
+            SELECT
+                timestamp_ms,
+                timestamp,
+                sport,
+                team,
+                opposing_team,
+                percentage,
+                bbo_price,
+                total_spread
+            FROM deltas
+            WHERE sportsbook = 'Pinnacle'
+              AND timestamp_ms >= %s
+              AND timestamp_ms <= %s
+              AND UPPER(sport) = %s
+        """
+        params = [start_ms, end_ms, league]
+
+        if league in ['ATP', 'WTA']:
+            # Tennis names vary; use contains match similar to analyzer fallback behavior.
+            base_query += " AND (UPPER(team) LIKE UPPER(%s) OR UPPER(opposing_team) LIKE UPPER(%s))"
+            like_team = f"%{team_name}%"
+            params.extend([like_team, like_team])
+        else:
+            # Team sports use mapped abbreviations.
+            base_query += " AND (team = %s OR opposing_team = %s)"
+            params.extend([team_name, team_name])
+
+        base_query += " ORDER BY timestamp_ms ASC LIMIT 500"
+        cursor.execute(base_query, tuple(params))
+        records = cursor.fetchall()
+        if not records:
+            return None
+
+        # Remove LOCKED/invalid rows as analyzer3 does
+        valid_records = []
+        for r in records:
+            percentage_str = str(r.get('percentage')).upper() if r.get('percentage') is not None else ''
+            total_spread_str = str(r.get('total_spread')).upper() if r.get('total_spread') is not None else ''
+            bbo_price = r.get('bbo_price')
+            if 'LOCKED' in percentage_str or 'LOCKED' in total_spread_str:
+                continue
+            if bbo_price is None:
+                continue
+            try:
+                if float(bbo_price) == 0:
+                    continue
+            except Exception:
+                continue
+            valid_records.append(r)
+
+        if not valid_records:
+            return None
+
+        # Use team column as primary side matching (same as analyzer get_deltas_data)
+        matching = []
+        for r in valid_records:
+            team_val = (r.get('team') or '')
+            if league in ['ATP', 'WTA']:
+                # For tennis allow partial both ways.
+                if team_name.lower() in team_val.lower() or team_val.lower() in team_name.lower():
+                    matching.append(r)
+            else:
+                if team_val.upper() == str(team_name).upper():
+                    matching.append(r)
+
+        if not matching:
+            return None
+
+        if relation == 'before':
+            candidates = [r for r in matching if float(r.get('timestamp_ms') or 0) < fill_timestamp_ms]
+            if not candidates:
+                return None
+            chosen = max(candidates, key=lambda x: float(x.get('timestamp_ms') or 0))
+        else:
+            candidates = [r for r in matching if float(r.get('timestamp_ms') or 0) >= after_min_ms]
+            if not candidates:
+                return None
+            chosen = min(candidates, key=lambda x: float(x.get('timestamp_ms') or float('inf')))
+
+        # Add opponent percentage at closest timestamp, like analyzer3
+        opposing_team = chosen.get('opposing_team')
+        if opposing_team:
+            opp_candidates = [
+                r for r in valid_records
+                if (r.get('team') or '').upper() == str(opposing_team).upper()
+            ]
+            if opp_candidates:
+                target_ts = float(chosen.get('timestamp_ms') or 0)
+                closest_opp = min(opp_candidates, key=lambda r: abs(float(r.get('timestamp_ms') or 0) - target_ts))
+                chosen['opponent_percentage'] = closest_opp.get('percentage')
+
+        return _normalize_deltas_record(chosen, fill_timestamp_ms, relation)
+    except Exception as e:
+        print(f"⚠️  Error getting Pinnacle {relation}: {e}")
+        return None
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+async def get_pinnacle_before(market_slug: str, token_label: str, fill_timestamp_ms: int):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _get_pinnacle_bbo_sync, market_slug, token_label, fill_timestamp_ms, 'before')
+
+async def get_pinnacle_after(market_slug: str, token_label: str, fill_timestamp_ms: int):
+    # Keep bounded by semaphore similarly to DB-heavy after lookups
+    async with db_semaphore:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get_pinnacle_bbo_sync, market_slug, token_label, fill_timestamp_ms, 'after')
+
 async def get_polymarket_bbo_before(market_slug: str, token_label: str, fill_timestamp: int):
     """Get Polymarket Before BBO data - match by market_slug and token_label"""
     # Run database query in thread pool to avoid blocking
@@ -906,7 +1182,9 @@ async def process_order_batch(orders: List[Dict]):
                 try:
                     polymarket_before = await get_polymarket_bbo_before(ms, tl, ts)
                     od['polymarket_before'] = polymarket_before
-                    if polymarket_before:
+                    pinnacle_before = await get_pinnacle_before(ms, tl, ts)
+                    od['pinnacle_before'] = pinnacle_before
+                    if polymarket_before or pinnacle_before:
                         await sio.emit('order-update', od)
                 except Exception as e:
                     print(f"⚠️  Error fetching Before data for {od.get('tx_hash')}: {e}")
@@ -924,6 +1202,7 @@ async def process_order_batch(orders: List[Dict]):
             # Schedule delayed updates
             asyncio.create_task(update_polymarket_after(order_id, delay=10))
             asyncio.create_task(update_polymarket_after(order_id, delay=60))
+            asyncio.create_task(update_polymarket_after(order_id, delay=120))
     
     # Process all Before queries in parallel
     if tasks:
@@ -977,13 +1256,15 @@ async def update_polymarket_after(order_id: str, delay: int):
     
     # Get After data - match by token_label (looking for data from 10s after fill)
     polymarket_after = await get_polymarket_bbo_after(market_slug, token_label, timestamp_ms)
+    pinnacle_after = await get_pinnacle_after(market_slug, token_label, timestamp_ms)
     
-    if polymarket_after:
+    if polymarket_after or pinnacle_after:
         order_data['polymarket_after'] = polymarket_after
+        order_data['pinnacle_after'] = pinnacle_after
         
         # Calculate Sportbook (best_bid from after, and price difference)
         fill_price = order_data.get('price', 0)
-        sportbook_bid = polymarket_after.get('best_bid')
+        sportbook_bid = polymarket_after.get('best_bid') if polymarket_after else None
         
         if sportbook_bid:
             price_diff = fill_price - sportbook_bid
@@ -991,25 +1272,47 @@ async def update_polymarket_after(order_id: str, delay: int):
                 'best_bid': sportbook_bid,
                 'fill_price': fill_price,
                 'price_diff': price_diff,
-                'price_diff_pct': (price_diff / sportbook_bid * 100) if sportbook_bid > 0 else 0
+                # Percent-point diff on 0-1 price scale: (fill - best_bid) * 100
+                'price_diff_pct': (price_diff * 100) if sportbook_bid > 0 else 0
             }
         else:
             order_data['sportbook'] = None
+
+        # Calculate Pinnacle Sportbook from Pinnacle After BBO (same style as PM sportbook)
+        pinnacle_bid = pinnacle_after.get('bbo') if pinnacle_after else None
+        if pinnacle_bid:
+            pn_price_diff = fill_price - pinnacle_bid
+            order_data['pinnacle_sportbook'] = {
+                'best_bid': pinnacle_bid,
+                'fill_price': fill_price,
+                'price_diff': pn_price_diff,
+                # Percent-point diff on 0-1 price scale: (fill - best_bid) * 100
+                'price_diff_pct': (pn_price_diff * 100) if pinnacle_bid > 0 else 0
+            }
+        else:
+            order_data['pinnacle_sportbook'] = None
         
         # Update order in history
         store_order_in_history(order_data)
         
         # Broadcast update to frontend
         await sio.emit('order-update', order_data)
-        print(f"🔄 Updated After/Sportbook for order {order_id} (after {delay}s)")
+        print(f"🔄 Updated After/Sportbook/Pinnacle for order {order_id} (after {delay}s)")
     else:
-        print(f"⚠️  No After data found for order {order_id} after {delay}s")
+        print(f"⚠️  No After data found (PM/Pinnacle) for order {order_id} after {delay}s")
     
-    # Remove from pending after 1min update (final update, stop tracking)
-    if delay >= 60:
-        if order_id in pending_updates:
-            del pending_updates[order_id]
-            print(f"✅ Completed updates for order {order_id} (removed from pending)")
+    # Remove from pending:
+    # - at 60s if we already have PM/PN after data
+    # - always at 120s (final retry)
+    has_pm_after = order_data.get('polymarket_after') is not None
+    has_pn_after = order_data.get('pinnacle_after') is not None
+    has_any_after = has_pm_after or has_pn_after
+
+    should_finalize = delay >= 120 or (delay >= 60 and has_any_after)
+    if should_finalize and order_id in pending_updates:
+        del pending_updates[order_id]
+        reason = "120s final retry completed" if delay >= 120 else "after data found by 60s"
+        print(f"✅ Completed updates for order {order_id} ({reason}, removed from pending)")
 
 async def connect_to_dome():
     """Connect to Dome API WebSocket"""
@@ -1088,6 +1391,9 @@ async def handle_dome_message(message: str):
             order_data['polymarket_before'] = None
             order_data['polymarket_after'] = None
             order_data['sportbook'] = None
+            order_data['pinnacle_before'] = None
+            order_data['pinnacle_after'] = None
+            order_data['pinnacle_sportbook'] = None
             
             # Add to queue for batch processing
             if order_queue:

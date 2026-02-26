@@ -41,7 +41,10 @@ const columnVisibility = {
   'tx-hash': true,
   'pm-before': true,
   'pm-after': true,
-  'pm-sportbook': true
+  'pm-sportbook': true,
+  'pn-before': true,
+  'pn-after': true,
+  'pn-sportbook': true
 };
 
 // DOM elements
@@ -201,6 +204,59 @@ function formatPolymarketDetails(pmData, label) {
     return `<div class="pm-details">
       <div class="pm-label">${label}</div>
       <div class="pm-value">No data</div>
+    </div>`;
+  }
+
+  const isPinnacle = pmData.source === 'pinnacle' || label.startsWith('PN_');
+  if (isPinnacle) {
+    const prettyLabel = label === 'PN_BEFORE'
+      ? 'PINNACLE DELTAS (BEFORE)'
+      : label === 'PN_AFTER'
+        ? 'PINNACLE DELTAS (AFTER)'
+        : label;
+    const percentageRaw = pmData.percentage;
+    const percentageDisplay = percentageRaw === undefined || percentageRaw === null || percentageRaw === ''
+      ? '-'
+      : String(percentageRaw).includes('%')
+        ? String(percentageRaw)
+        : `${percentageRaw}%`;
+    const oppPercentageRaw = pmData.opponent_percentage;
+    const oppPercentageDisplay = oppPercentageRaw === undefined || oppPercentageRaw === null || oppPercentageRaw === ''
+      ? '-'
+      : String(oppPercentageRaw).includes('%')
+        ? String(oppPercentageRaw)
+        : `${oppPercentageRaw}%`;
+
+    return `<div class="pm-details">
+      <div class="pm-label">${prettyLabel}</div>
+      <div class="pm-row">
+        <span class="pm-field">TIMESTAMP:</span>
+        <span class="pm-value timestamp">${pmData.timestamp || '-'}</span>
+      </div>
+      <div class="pm-row">
+        <span class="pm-field">TEAM:</span>
+        <span class="pm-value">${pmData.team || '-'}</span>
+      </div>
+      <div class="pm-row">
+        <span class="pm-field">OPPOSING TEAM:</span>
+        <span class="pm-value">${pmData.opposing_team || '-'}</span>
+      </div>
+      <div class="pm-row">
+        <span class="pm-field">BBO PRICE:</span>
+        <span class="pm-value">$${Number(pmData.bbo).toFixed(3)}</span>
+      </div>
+      <div class="pm-row">
+        <span class="pm-field">PERCENTAGE ODDS:</span>
+        <span class="pm-value">${percentageDisplay}</span>
+      </div>
+      <div class="pm-row">
+        <span class="pm-field">OPP PERCENTAGE ODDS:</span>
+        <span class="pm-value">${oppPercentageDisplay}</span>
+      </div>
+      <div class="pm-row">
+        <span class="pm-field">SECONDS FROM FILL:</span>
+        <span class="pm-value">${pmData.seconds_from_fill !== undefined ? `${pmData.seconds_from_fill}s` : '-'}</span>
+      </div>
     </div>`;
   }
   
@@ -370,6 +426,7 @@ window.setTimeFilter = function(filter) {
   
   // Refresh all summaries
   loadPMSummary();
+  loadPinnacleSummary();
   loadGameSummaries();
   loadOppositePartiesSummary();
 };
@@ -382,6 +439,7 @@ window.setGameSlugFilter = function(value) {
 
   // Refresh all summaries/cards
   loadPMSummary();
+  loadPinnacleSummary();
   loadGameSummaries();
   loadOppositePartiesSummary();
 };
@@ -393,6 +451,7 @@ window.setCounterpartyFilter = function(value) {
 
   // Keep summaries/cards in sync with active filters
   loadPMSummary();
+  loadPinnacleSummary();
   loadGameSummaries();
   loadOppositePartiesSummary();
 };
@@ -401,6 +460,7 @@ window.setUserFilter = function(value) {
   userFilter = (value || '').trim().toLowerCase();
   applyTimeFilterToMainTable();
   loadPMSummary();
+  loadPinnacleSummary();
   loadGameSummaries();
   loadOppositePartiesSummary();
 };
@@ -484,12 +544,54 @@ function getFilteredOrders() {
   return allOrders.filter(isOrderVisibleByFilters);
 }
 
-function formatSportbook(sportbookData) {
+function formatSportbook(sportbookData, fillPrice = null) {
   if (!sportbookData || sportbookData.best_bid === undefined || sportbookData.best_bid === null) return '-';
-  const diff = sportbookData.price_diff;
-  const diffPct = sportbookData.price_diff_pct;
-  const sign = diff >= 0 ? '+' : '';
-  return `${sportbookData.best_bid.toFixed(4)} (${sign}${diff.toFixed(4)}, ${sign}${diffPct.toFixed(2)}%)`;
+  const bestBid = Number(sportbookData.best_bid);
+  const effectiveFill = fillPrice !== null && fillPrice !== undefined
+    ? Number(fillPrice)
+    : Number(sportbookData.fill_price);
+  // Always compute from fill and best bid: (fill - best_bid) * 100
+  const diffPct = Number.isFinite(effectiveFill) && Number.isFinite(bestBid)
+    ? (effectiveFill - bestBid) * 100
+    : Number(sportbookData.price_diff_pct ?? 0);
+  const sign = diffPct >= 0 ? '+' : '';
+  const color = diffPct < 0 ? 'var(--accent-green)' : diffPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
+  return `<span style="font-weight: 700; color: ${color};">${sign}${diffPct.toFixed(2)}%</span>`;
+}
+
+function parsePercentageToDecimal(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'string') {
+    const cleaned = value.replace('%', '').trim();
+    const parsed = Number(cleaned);
+    if (!Number.isFinite(parsed)) return null;
+    return parsed > 1 ? parsed / 100 : parsed;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return numeric > 1 ? numeric / 100 : numeric;
+}
+
+function formatPinnacleSportbook(fillPrice, pinnacleAfter, fallbackSportbookData = null) {
+  const fill = Number(fillPrice);
+  const oppDecimal = parsePercentageToDecimal(pinnacleAfter?.opponent_percentage);
+  let diffPct = null;
+
+  // Requested formula:
+  // (Fill Price - (1 - Opposite percentage odds)) * 100
+  if (Number.isFinite(fill) && oppDecimal !== null) {
+    const impliedFromOpp = 1 - oppDecimal;
+    diffPct = (fill - impliedFromOpp) * 100;
+  } else if (fallbackSportbookData && fallbackSportbookData.price_diff_pct !== undefined) {
+    // Safe fallback for older cached rows
+    diffPct = Number(fallbackSportbookData.price_diff_pct);
+  }
+
+  if (diffPct === null || !Number.isFinite(diffPct)) return '-';
+
+  const sign = diffPct >= 0 ? '+' : '';
+  const color = diffPct < 0 ? 'var(--accent-green)' : diffPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
+  return `<span style="font-weight: 700; color: ${color};">${sign}${diffPct.toFixed(2)}%</span>`;
 }
 
 // State for opposite parties table expansion
@@ -540,9 +642,13 @@ async function loadGameSummaries() {
           beforeSpread: 0,
           afterSpread: 0,
           sportbookSpread: 0,
+          pinnacleBeforeSpread: 0,
+          pinnacleAfterSpread: 0,
           beforeCount: 0,
           afterCount: 0,
           sportbookCount: 0,
+          pinnacleBeforeCount: 0,
+          pinnacleAfterCount: 0,
           takers: {} // Track takers for this game
         };
       }
@@ -594,6 +700,20 @@ async function loadGameSummaries() {
         gameStats[gameSlug].sportbookSpread += spread;
         gameStats[gameSlug].sportbookCount += 1;
       }
+
+      // Pinnacle Before
+      if (order.pinnacle_before && order.pinnacle_before.bbo !== undefined && order.pinnacle_before.bbo !== null) {
+        const spread = (order.price - order.pinnacle_before.bbo) * (order.shares_normalized || 0);
+        gameStats[gameSlug].pinnacleBeforeSpread += spread;
+        gameStats[gameSlug].pinnacleBeforeCount += 1;
+      }
+
+      // Pinnacle After
+      if (order.pinnacle_after && order.pinnacle_after.bbo !== undefined && order.pinnacle_after.bbo !== null) {
+        const spread = (order.price - order.pinnacle_after.bbo) * (order.shares_normalized || 0);
+        gameStats[gameSlug].pinnacleAfterSpread += spread;
+        gameStats[gameSlug].pinnacleAfterCount += 1;
+      }
     });
     
     // Sort games by total volume (descending)
@@ -626,6 +746,10 @@ async function loadGameSummaries() {
         ? (stats.afterSpread / stats.totalVolume) * 100 : null;
       const avgSportbookPct = stats.totalVolume > 0 && stats.sportbookCount > 0 
         ? (stats.sportbookSpread / stats.totalVolume) * 100 : null;
+      const avgPinnacleBeforePct = stats.totalVolume > 0 && stats.pinnacleBeforeCount > 0
+        ? (stats.pinnacleBeforeSpread / stats.totalVolume) * 100 : null;
+      const avgPinnacleAfterPct = stats.totalVolume > 0 && stats.pinnacleAfterCount > 0
+        ? (stats.pinnacleAfterSpread / stats.totalVolume) * 100 : null;
       
       // Get top 3 takers by volume
       const takersArray = Object.entries(stats.takers)
@@ -670,6 +794,8 @@ async function loadGameSummaries() {
             beforeSpreads: [],
             afterSpreads: [],
             sportbookSpreads: [],
+            pinnacleBeforeSpreads: [],
+            pinnacleAfterSpreads: [],
             maxFill: 0
           };
         }
@@ -690,6 +816,14 @@ async function loadGameSummaries() {
         if (order.sportbook && order.sportbook.best_bid !== undefined && order.sportbook.best_bid !== null) {
           const spreadPct = ((order.price - order.sportbook.best_bid) / order.price) * 100;
           teamStats[team].sportbookSpreads.push(spreadPct);
+        }
+        if (order.pinnacle_before && order.pinnacle_before.bbo !== undefined && order.pinnacle_before.bbo !== null) {
+          const spreadPct = ((order.price - order.pinnacle_before.bbo) / order.price) * 100;
+          teamStats[team].pinnacleBeforeSpreads.push(spreadPct);
+        }
+        if (order.pinnacle_after && order.pinnacle_after.bbo !== undefined && order.pinnacle_after.bbo !== null) {
+          const spreadPct = ((order.price - order.pinnacle_after.bbo) / order.price) * 100;
+          teamStats[team].pinnacleAfterSpreads.push(spreadPct);
         }
       });
       
@@ -734,11 +868,15 @@ async function loadGameSummaries() {
             </div>
             <div style="padding: 0.75rem; background: #f9fafb; border-radius: 6px; border: 1px solid #e5e7eb;">
               <div style="font-size: 0.6875rem; color: #6b7280; margin-bottom: 0.375rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.025em;">Avg Spread Before (PN)</div>
-              <div style="font-size: 1rem; font-weight: 700; color: #9ca3af;">N/A</div>
+              <div style="font-size: 1rem; font-weight: 700; color: ${avgPinnacleBeforePct !== null && avgPinnacleBeforePct < 0 ? '#10b981' : avgPinnacleBeforePct !== null ? '#ef4444' : '#9ca3af'};">
+                ${avgPinnacleBeforePct !== null ? `${avgPinnacleBeforePct >= 0 ? '+' : ''}${avgPinnacleBeforePct.toFixed(2)}%` : 'N/A'}
+              </div>
             </div>
             <div style="padding: 0.75rem; background: #f9fafb; border-radius: 6px; border: 1px solid #e5e7eb;">
               <div style="font-size: 0.6875rem; color: #6b7280; margin-bottom: 0.375rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.025em;">Avg Spread After (PN)</div>
-              <div style="font-size: 1rem; font-weight: 700; color: #9ca3af;">N/A</div>
+              <div style="font-size: 1rem; font-weight: 700; color: ${avgPinnacleAfterPct !== null && avgPinnacleAfterPct < 0 ? '#10b981' : avgPinnacleAfterPct !== null ? '#ef4444' : '#9ca3af'};">
+                ${avgPinnacleAfterPct !== null ? `${avgPinnacleAfterPct >= 0 ? '+' : ''}${avgPinnacleAfterPct.toFixed(2)}%` : 'N/A'}
+              </div>
             </div>
           </div>
           
@@ -756,6 +894,12 @@ async function loadGameSummaries() {
                 : null;
               const avgSportbook = teamData.sportbookSpreads.length > 0
                 ? teamData.sportbookSpreads.reduce((a, b) => a + b, 0) / teamData.sportbookSpreads.length
+                : null;
+              const avgPinnacleBefore = teamData.pinnacleBeforeSpreads.length > 0
+                ? teamData.pinnacleBeforeSpreads.reduce((a, b) => a + b, 0) / teamData.pinnacleBeforeSpreads.length
+                : null;
+              const avgPinnacleAfter = teamData.pinnacleAfterSpreads.length > 0
+                ? teamData.pinnacleAfterSpreads.reduce((a, b) => a + b, 0) / teamData.pinnacleAfterSpreads.length
                 : null;
               
               return `
@@ -784,11 +928,15 @@ async function loadGameSummaries() {
                     </div>
                     <div style="font-size: 0.75rem; color: #6b7280;">
                       <span style="font-weight: 500;">Pinnacle Before:</span> 
-                      <span style="font-weight: 600; color: #9ca3af; margin-left: 0.25rem;">N/A</span>
+                      <span style="font-weight: 600; color: ${avgPinnacleBefore !== null && avgPinnacleBefore < 0 ? '#10b981' : avgPinnacleBefore !== null ? '#ef4444' : '#9ca3af'}; margin-left: 0.25rem;">
+                        ${avgPinnacleBefore !== null ? `${avgPinnacleBefore >= 0 ? '+' : ''}${avgPinnacleBefore.toFixed(2)}%` : 'N/A'}
+                      </span>
                     </div>
                     <div style="font-size: 0.75rem; color: #6b7280;">
                       <span style="font-weight: 500;">Pinnacle After:</span> 
-                      <span style="font-weight: 600; color: #9ca3af; margin-left: 0.25rem;">N/A</span>
+                      <span style="font-weight: 600; color: ${avgPinnacleAfter !== null && avgPinnacleAfter < 0 ? '#10b981' : avgPinnacleAfter !== null ? '#ef4444' : '#9ca3af'}; margin-left: 0.25rem;">
+                        ${avgPinnacleAfter !== null ? `${avgPinnacleAfter >= 0 ? '+' : ''}${avgPinnacleAfter.toFixed(2)}%` : 'N/A'}
+                      </span>
                     </div>
                     <div style="font-size: 0.75rem; color: #6b7280;">
                       <span style="font-weight: 500;">Fill Count:</span> 
@@ -892,6 +1040,8 @@ function loadPMSummary() {
     let totalBeforeSpread = 0;
     let totalAfterSpread = 0;
     let totalSportbookSpread = 0;
+    let totalSportbookPctSum = 0;
+    let totalSportbookCount = 0;
     
     orders.forEach(order => {
       const league = extractLeague(order.market_slug);
@@ -906,7 +1056,9 @@ function loadPMSummary() {
           fills: 0,
           beforeSpread: 0,
           afterSpread: 0,
-          sportbookSpread: 0
+          sportbookSpread: 0,
+          sportbookPctSum: 0,
+          sportbookCount: 0
         };
       }
       
@@ -930,8 +1082,13 @@ function loadPMSummary() {
       // PM Sportbook spread
       if (order.sportbook && order.sportbook.best_bid !== undefined && order.sportbook.best_bid !== null) {
         const spread = (order.price - order.sportbook.best_bid) * (order.shares_normalized || 0);
+        const sportbookPct = (order.price - order.sportbook.best_bid) * 100;
         leagueStats[league].sportbookSpread += spread;
+        leagueStats[league].sportbookPctSum += sportbookPct;
+        leagueStats[league].sportbookCount += 1;
         totalSportbookSpread += spread;
+        totalSportbookPctSum += sportbookPct;
+        totalSportbookCount += 1;
       }
     });
     
@@ -948,11 +1105,11 @@ function loadPMSummary() {
     
     const beforePct = totalFillValue > 0 ? (totalBeforeSpread / totalFillValue) * 100 : 0;
     const afterPct = totalFillValue > 0 ? (totalAfterSpread / totalFillValue) * 100 : 0;
-    const sportbookPct = totalFillValue > 0 ? (totalSportbookSpread / totalFillValue) * 100 : 0;
+    const sportbookPct = totalSportbookCount > 0 ? (totalSportbookPctSum / totalSportbookCount) : 0;
     
     const beforeColor = totalBeforeSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
     const afterColor = totalAfterSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
-    const sportbookColor = totalSportbookSpread > 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+    const sportbookColor = sportbookPct < 0 ? 'var(--accent-green)' : sportbookPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
     
     let html = `
       <div style="margin-bottom: 2rem;">
@@ -1057,8 +1214,8 @@ function loadPMSummary() {
             <div style="space-y: 0.5rem;">
               ${sortedLeagues.map(league => {
                 const stats = leagueStats[league];
-                const leaguePct = stats.fillValue > 0 ? (stats.sportbookSpread / stats.fillValue) * 100 : 0;
-                const leagueColor = stats.sportbookSpread > 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                const leaguePct = stats.sportbookCount > 0 ? (stats.sportbookPctSum / stats.sportbookCount) : 0;
+                const leagueColor = leaguePct < 0 ? 'var(--accent-green)' : leaguePct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
                 return `
                   <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
                     <div style="display: flex; align-items: center; gap: 0.75rem;">
@@ -1088,6 +1245,236 @@ function loadPMSummary() {
     const container = document.getElementById('pm-summary-container');
     if (container) {
       container.innerHTML = `<div style="text-align: center; padding: 2rem; color: var(--accent-red);">Error loading PM summary</div>`;
+    }
+  }
+}
+
+// Calculate and display Pinnacle summary
+function loadPinnacleSummary() {
+  try {
+    const orders = getFilteredOrders();
+
+    const leagueStats = {};
+    let totalFillValue = 0;
+    let totalBeforeSpread = 0;
+    let totalAfterSpread = 0;
+    let totalSportbookSpread = 0;
+    let totalSportbookPctSum = 0;
+    let totalSportbookCount = 0;
+
+    orders.forEach(order => {
+      const league = extractLeague(order.market_slug);
+      if (league === '-') return;
+
+      const fillPrice = Number(order.price);
+      const shares = Number(order.shares_normalized || 0);
+      if (!Number.isFinite(fillPrice)) return;
+
+      const fillValue = fillPrice * shares;
+      totalFillValue += fillValue;
+
+      if (!leagueStats[league]) {
+        leagueStats[league] = {
+          fillValue: 0,
+          fills: 0,
+          beforeSpread: 0,
+          afterSpread: 0,
+          sportbookSpread: 0,
+          sportbookPctSum: 0,
+          sportbookCount: 0
+        };
+      }
+
+      leagueStats[league].fillValue += fillValue;
+      leagueStats[league].fills += 1;
+
+      if (order.pinnacle_before && order.pinnacle_before.bbo !== undefined && order.pinnacle_before.bbo !== null) {
+        const beforeBbo = Number(order.pinnacle_before.bbo);
+        if (Number.isFinite(beforeBbo)) {
+          const spread = (fillPrice - beforeBbo) * shares;
+          leagueStats[league].beforeSpread += spread;
+          totalBeforeSpread += spread;
+        }
+      }
+
+      if (order.pinnacle_after && order.pinnacle_after.bbo !== undefined && order.pinnacle_after.bbo !== null) {
+        const afterBbo = Number(order.pinnacle_after.bbo);
+        if (Number.isFinite(afterBbo)) {
+          const spread = (fillPrice - afterBbo) * shares;
+          leagueStats[league].afterSpread += spread;
+          totalAfterSpread += spread;
+        }
+      }
+
+      // PN Sportbook formula:
+      // (Fill Price - (1 - Opposite Percentage Odds)) * 100
+      const oppDecimal = parsePercentageToDecimal(order?.pinnacle_after?.opponent_percentage);
+      if (oppDecimal !== null) {
+        const impliedFromOpp = 1 - oppDecimal;
+        const sportbookPct = (fillPrice - impliedFromOpp) * 100;
+        const sportbookSpread = (fillPrice - impliedFromOpp) * shares;
+        leagueStats[league].sportbookSpread += sportbookSpread;
+        leagueStats[league].sportbookPctSum += sportbookPct;
+        leagueStats[league].sportbookCount += 1;
+        totalSportbookSpread += sportbookSpread;
+        totalSportbookPctSum += sportbookPct;
+        totalSportbookCount += 1;
+      } else if (order?.pinnacle_sportbook?.price_diff_pct !== undefined && order?.pinnacle_sportbook?.price_diff_pct !== null) {
+        // Fallback for legacy rows missing opponent_percentage
+        const sportbookPct = Number(order.pinnacle_sportbook.price_diff_pct);
+        if (Number.isFinite(sportbookPct)) {
+          const sportbookSpread = (sportbookPct / 100) * shares;
+          leagueStats[league].sportbookSpread += sportbookSpread;
+          leagueStats[league].sportbookPctSum += sportbookPct;
+          leagueStats[league].sportbookCount += 1;
+          totalSportbookSpread += sportbookSpread;
+          totalSportbookPctSum += sportbookPct;
+          totalSportbookCount += 1;
+        }
+      }
+    });
+
+    const sortedLeagues = Object.keys(leagueStats).sort((a, b) =>
+      leagueStats[b].fillValue - leagueStats[a].fillValue
+    );
+
+    const container = document.getElementById('pn-summary-container');
+    if (!container) return;
+
+    const beforePct = totalFillValue > 0 ? (totalBeforeSpread / totalFillValue) * 100 : 0;
+    const afterPct = totalFillValue > 0 ? (totalAfterSpread / totalFillValue) * 100 : 0;
+    const sportbookPct = totalSportbookCount > 0 ? (totalSportbookPctSum / totalSportbookCount) : 0;
+
+    const beforeColor = totalBeforeSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+    const afterColor = totalAfterSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+    const sportbookColor = sportbookPct < 0 ? 'var(--accent-green)' : sportbookPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
+
+    let html = `
+      <div style="margin-bottom: 2rem;">
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem;">
+          <div style="background: white; border-radius: 12px; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid var(--border-color);">
+            <div style="margin-bottom: 1rem;">
+              <button style="background: #facc15; color: #111827; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-weight: 600; font-size: 0.875rem; cursor: default;">PINNACLE DELTAS</button>
+            </div>
+            <div style="text-align: center; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 2px solid var(--border-color);">
+              <div style="font-size: 1.5rem; font-weight: 700; color: ${beforeColor}; margin-bottom: 0.25rem;">
+                ${totalBeforeSpread >= 0 ? '+' : ''}$${Math.abs(totalBeforeSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
+              </div>
+              <div style="font-size: 0.875rem; color: ${beforeColor};">
+                ${beforePct >= 0 ? '+' : ''}${beforePct.toFixed(2)}%
+              </div>
+            </div>
+            <div style="font-size: 0.75rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">TOTAL FILL VALUE x PINNACLE SPREAD BEFORE</div>
+            <div>
+              ${sortedLeagues.map(league => {
+                const stats = leagueStats[league];
+                const leaguePct = stats.fillValue > 0 ? (stats.beforeSpread / stats.fillValue) * 100 : 0;
+                const leagueColor = stats.beforeSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                return `
+                  <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
+                    <div style="display: flex; align-items: center; gap: 0.75rem;">
+                      <span style="background: #f1f3f5; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; color: var(--text-primary);">${league}</span>
+                      <span style="font-size: 0.875rem; color: var(--text-primary);">$${stats.fillValue.toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})} • ${stats.fills} fills</span>
+                    </div>
+                    <div style="text-align: right;">
+                      <div style="font-size: 0.875rem; font-weight: 600; color: ${leagueColor};">
+                        ${stats.beforeSpread >= 0 ? '+' : ''}$${Math.abs(stats.beforeSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
+                      </div>
+                      <div style="font-size: 0.75rem; color: ${leagueColor};">
+                        (${leaguePct >= 0 ? '+' : ''}${leaguePct.toFixed(2)}%)
+                      </div>
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+
+          <div style="background: white; border-radius: 12px; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid var(--border-color);">
+            <div style="margin-bottom: 1rem;">
+              <button style="background: #facc15; color: #111827; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-weight: 600; font-size: 0.875rem; cursor: default;">PINNACLE DELTAS</button>
+            </div>
+            <div style="text-align: center; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 2px solid var(--border-color);">
+              <div style="font-size: 1.5rem; font-weight: 700; color: ${afterColor}; margin-bottom: 0.25rem;">
+                ${totalAfterSpread >= 0 ? '+' : ''}$${Math.abs(totalAfterSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
+              </div>
+              <div style="font-size: 0.875rem; color: ${afterColor};">
+                ${afterPct >= 0 ? '+' : ''}${afterPct.toFixed(2)}%
+              </div>
+            </div>
+            <div style="font-size: 0.75rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">TOTAL FILL VALUE x PINNACLE SPREAD AFTER</div>
+            <div>
+              ${sortedLeagues.map(league => {
+                const stats = leagueStats[league];
+                const leaguePct = stats.fillValue > 0 ? (stats.afterSpread / stats.fillValue) * 100 : 0;
+                const leagueColor = stats.afterSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                return `
+                  <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
+                    <div style="display: flex; align-items: center; gap: 0.75rem;">
+                      <span style="background: #f1f3f5; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; color: var(--text-primary);">${league}</span>
+                      <span style="font-size: 0.875rem; color: var(--text-primary);">$${stats.fillValue.toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})} • ${stats.fills} fills</span>
+                    </div>
+                    <div style="text-align: right;">
+                      <div style="font-size: 0.875rem; font-weight: 600; color: ${leagueColor};">
+                        ${stats.afterSpread >= 0 ? '+' : ''}$${Math.abs(stats.afterSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
+                      </div>
+                      <div style="font-size: 0.75rem; color: ${leagueColor};">
+                        (${leaguePct >= 0 ? '+' : ''}${leaguePct.toFixed(2)}%)
+                      </div>
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+
+          <div style="background: white; border-radius: 12px; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid var(--border-color);">
+            <div style="margin-bottom: 1rem;">
+              <button style="background: #facc15; color: #111827; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-weight: 600; font-size: 0.875rem; cursor: default;">PINNACLE DELTAS</button>
+            </div>
+            <div style="text-align: center; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 2px solid var(--border-color);">
+              <div style="font-size: 1.5rem; font-weight: 700; color: ${sportbookColor}; margin-bottom: 0.25rem;">
+                ${totalSportbookSpread >= 0 ? '+' : ''}$${Math.abs(totalSportbookSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
+              </div>
+              <div style="font-size: 0.875rem; color: ${sportbookColor};">
+                ${sportbookPct >= 0 ? '+' : ''}${sportbookPct.toFixed(2)}%
+              </div>
+            </div>
+            <div style="font-size: 0.75rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">TOTAL FILL VALUE x PINNACLE SPORTSBOOK</div>
+            <div>
+              ${sortedLeagues.map(league => {
+                const stats = leagueStats[league];
+                const leaguePct = stats.sportbookCount > 0 ? (stats.sportbookPctSum / stats.sportbookCount) : 0;
+                const leagueColor = leaguePct < 0 ? 'var(--accent-green)' : leaguePct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
+                return `
+                  <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
+                    <div style="display: flex; align-items: center; gap: 0.75rem;">
+                      <span style="background: #f1f3f5; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; color: var(--text-primary);">${league}</span>
+                      <span style="font-size: 0.875rem; color: var(--text-primary);">$${stats.fillValue.toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})} • ${stats.fills} fills</span>
+                    </div>
+                    <div style="text-align: right;">
+                      <div style="font-size: 0.875rem; font-weight: 600; color: ${leagueColor};">
+                        ${stats.sportbookSpread >= 0 ? '+' : ''}$${Math.abs(stats.sportbookSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
+                      </div>
+                      <div style="font-size: 0.75rem; color: ${leagueColor};">
+                        (${leaguePct >= 0 ? '+' : ''}${leaguePct.toFixed(2)}%)
+                      </div>
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    container.innerHTML = html;
+  } catch (error) {
+    console.error('❌ Error loading Pinnacle summary:', error);
+    const container = document.getElementById('pn-summary-container');
+    if (container) {
+      container.innerHTML = `<div style="text-align: center; padding: 2rem; color: var(--accent-red);">Error loading Pinnacle summary</div>`;
     }
   }
 }
@@ -1424,6 +1811,9 @@ function handleOrderUpdate(data, skipStats = false) {
         const pmBeforeCell = existingRow.querySelector('td[data-column="pm-before"]');
         const pmAfterCell = existingRow.querySelector('td[data-column="pm-after"]');
         const pmSportbookCell = existingRow.querySelector('td[data-column="pm-sportbook"]');
+        const pnBeforeCell = existingRow.querySelector('td[data-column="pn-before"]');
+        const pnAfterCell = existingRow.querySelector('td[data-column="pn-after"]');
+        const pnSportbookCell = existingRow.querySelector('td[data-column="pn-sportbook"]');
 
         if (txHashCell) {
           txHashCell.innerHTML = formatTxHashLink(data.tx_hash);
@@ -1448,7 +1838,24 @@ function handleOrderUpdate(data, skipStats = false) {
           if (toggleEl) toggleEl.textContent = '▶';
         }
         if (pmSportbookCell) {
-          pmSportbookCell.textContent = formatSportbook(data.sportbook);
+          pmSportbookCell.innerHTML = formatSportbook(data.sportbook, data.price);
+        }
+        if (pnBeforeCell) {
+          pnBeforeCell.innerHTML = formatPolymarketPercentage(data.price, data.pinnacle_before, 'PN_BEFORE', orderId);
+          const expandedEl = document.getElementById(`pm-pn_before-${orderId}`);
+          if (expandedEl) expandedEl.style.display = 'none';
+          const toggleEl = pnBeforeCell.querySelector('.pm-toggle');
+          if (toggleEl) toggleEl.textContent = '▶';
+        }
+        if (pnAfterCell) {
+          pnAfterCell.innerHTML = formatPolymarketPercentage(data.price, data.pinnacle_after, 'PN_AFTER', orderId);
+          const expandedEl = document.getElementById(`pm-pn_after-${orderId}`);
+          if (expandedEl) expandedEl.style.display = 'none';
+          const toggleEl = pnAfterCell.querySelector('.pm-toggle');
+          if (toggleEl) toggleEl.textContent = '▶';
+        }
+        if (pnSportbookCell) {
+          pnSportbookCell.innerHTML = formatPinnacleSportbook(data.price, data.pinnacle_after, data.pinnacle_sportbook);
         }
         
         // Highlight the row to show it was updated
@@ -1471,6 +1878,7 @@ function handleOrderUpdate(data, skipStats = false) {
       if (summaryUpdateTimer) clearTimeout(summaryUpdateTimer);
       summaryUpdateTimer = setTimeout(() => {
         loadPMSummary();
+        loadPinnacleSummary();
         loadGameSummaries();
       }, 300);
       
@@ -1552,7 +1960,10 @@ function handleOrderUpdate(data, skipStats = false) {
       <td data-column="tx-hash" class="address">${formatTxHashLink(data.tx_hash)}</td>
       <td data-column="pm-before" class="pm-cell">${formatPolymarketPercentage(data.price, data.polymarket_before, 'BEFORE', orderId)}</td>
       <td data-column="pm-after" class="pm-cell">${formatPolymarketPercentage(data.price, data.polymarket_after, 'AFTER', orderId)}</td>
-      <td data-column="pm-sportbook" class="number">${formatSportbook(data.sportbook)}</td>
+      <td data-column="pm-sportbook" class="number">${formatSportbook(data.sportbook, data.price)}</td>
+      <td data-column="pn-before" class="pm-cell">${formatPolymarketPercentage(data.price, data.pinnacle_before, 'PN_BEFORE', orderId)}</td>
+      <td data-column="pn-after" class="pm-cell">${formatPolymarketPercentage(data.price, data.pinnacle_after, 'PN_AFTER', orderId)}</td>
+      <td data-column="pn-sportbook" class="number">${formatPinnacleSportbook(data.price, data.pinnacle_after, data.pinnacle_sportbook)}</td>
     `;
     
     // Apply column visibility
@@ -1605,6 +2016,7 @@ function handleOrderUpdate(data, skipStats = false) {
     if (summaryUpdateTimer) clearTimeout(summaryUpdateTimer);
     summaryUpdateTimer = setTimeout(() => {
       loadPMSummary();
+      loadPinnacleSummary();
       loadGameSummaries();
     }, 100);
     
@@ -1643,7 +2055,7 @@ function createUI() {
         </div>
       </div>
       
-      <!-- Order: 1. Counterparties, 2. PM Summary, 3. Game Summaries, 4. Transaction Table -->
+      <!-- Order: 1. Counterparties, 2. PM Summary, 3. PN Summary, 4. Game Summaries, 5. Transaction Table -->
       <div class="opposite-parties-summary" id="opposite-parties-summary" style="margin-bottom: 2rem; width: 100%; clear: both; display: block;">
         <div id="opposite-parties-table-container">
           <div class="loading">Loading opposite parties data...</div>
@@ -1738,6 +2150,9 @@ function createUI() {
                 <label><input type="checkbox" data-column="pm-before" ${columnVisibility['pm-before'] ? 'checked' : ''} onchange="toggleColumn('pm-before', this.checked)"> PM Before</label>
                 <label><input type="checkbox" data-column="pm-after" ${columnVisibility['pm-after'] ? 'checked' : ''} onchange="toggleColumn('pm-after', this.checked)"> PM After</label>
                 <label><input type="checkbox" data-column="pm-sportbook" ${columnVisibility['pm-sportbook'] ? 'checked' : ''} onchange="toggleColumn('pm-sportbook', this.checked)"> PM Sportbook</label>
+                <label><input type="checkbox" data-column="pn-before" ${columnVisibility['pn-before'] ? 'checked' : ''} onchange="toggleColumn('pn-before', this.checked)"> PN Before</label>
+                <label><input type="checkbox" data-column="pn-after" ${columnVisibility['pn-after'] ? 'checked' : ''} onchange="toggleColumn('pn-after', this.checked)"> PN After</label>
+                <label><input type="checkbox" data-column="pn-sportbook" ${columnVisibility['pn-sportbook'] ? 'checked' : ''} onchange="toggleColumn('pn-sportbook', this.checked)"> PN Sportbook</label>
               </div>
             </div>
           </div>
@@ -1751,6 +2166,10 @@ function createUI() {
       
       <div id="pm-summary-container" style="margin-bottom: 2rem; width: 100%; clear: both; display: block;">
         <div class="loading">Loading PM summary...</div>
+      </div>
+
+      <div id="pn-summary-container" style="margin-bottom: 2rem; width: 100%; clear: both; display: block;">
+        <div class="loading">Loading Pinnacle summary...</div>
       </div>
       
       <div id="game-summaries-container" style="margin-bottom: 2rem; width: 100%; clear: both; display: block;">
@@ -1784,11 +2203,14 @@ function createUI() {
               <th data-column="pm-before">PM Before</th>
               <th data-column="pm-after">PM After</th>
               <th data-column="pm-sportbook">PM Sportbook</th>
+              <th data-column="pn-before">PN Before</th>
+              <th data-column="pn-after">PN After</th>
+              <th data-column="pn-sportbook">PN Sportbook</th>
             </tr>
           </thead>
           <tbody id="orders-table">
             <tr>
-              <td colspan="23" class="loading">Waiting for order updates...</td>
+              <td colspan="26" class="loading">Waiting for order updates...</td>
             </tr>
           </tbody>
         </table>
@@ -1808,6 +2230,7 @@ function createUI() {
   // Load PM summary and game summaries after a short delay to ensure orders are loaded
   setTimeout(() => {
     loadPMSummary();
+    loadPinnacleSummary();
     loadGameSummaries();
   }, 500);
   
