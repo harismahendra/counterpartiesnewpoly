@@ -1038,10 +1038,12 @@ function loadPMSummary() {
     const leagueStats = {};
     let totalFillValue = 0;
     let totalBeforeSpread = 0;
+    let totalBeforeFillValue = 0;
     let totalAfterSpread = 0;
+    let totalAfterFillValue = 0;
     let totalSportbookSpread = 0;
-    let totalSportbookPctSum = 0;
-    let totalSportbookCount = 0;
+    let totalSportbookFillValue = 0;
+    let totalSportbookPointPctWeighted = 0;
     
     orders.forEach(order => {
       const league = extractLeague(order.market_slug);
@@ -1055,10 +1057,12 @@ function loadPMSummary() {
           fillValue: 0,
           fills: 0,
           beforeSpread: 0,
+          beforeFillValue: 0,
           afterSpread: 0,
+          afterFillValue: 0,
           sportbookSpread: 0,
-          sportbookPctSum: 0,
-          sportbookCount: 0
+          sportbookFillValue: 0,
+          sportbookPointPctWeighted: 0
         };
       }
       
@@ -1069,26 +1073,30 @@ function loadPMSummary() {
       if (order.polymarket_before && order.polymarket_before.bbo !== undefined && order.polymarket_before.bbo !== null) {
         const spread = (order.price - order.polymarket_before.bbo) * (order.shares_normalized || 0);
         leagueStats[league].beforeSpread += spread;
+        leagueStats[league].beforeFillValue += fillValue;
         totalBeforeSpread += spread;
+        totalBeforeFillValue += fillValue;
       }
       
       // PM After spread
       if (order.polymarket_after && order.polymarket_after.bbo !== undefined && order.polymarket_after.bbo !== null) {
         const spread = (order.price - order.polymarket_after.bbo) * (order.shares_normalized || 0);
         leagueStats[league].afterSpread += spread;
+        leagueStats[league].afterFillValue += fillValue;
         totalAfterSpread += spread;
+        totalAfterFillValue += fillValue;
       }
       
       // PM Sportbook spread
       if (order.sportbook && order.sportbook.best_bid !== undefined && order.sportbook.best_bid !== null) {
         const spread = (order.price - order.sportbook.best_bid) * (order.shares_normalized || 0);
-        const sportbookPct = (order.price - order.sportbook.best_bid) * 100;
+        const pointPct = (order.price - order.sportbook.best_bid) * 100;
         leagueStats[league].sportbookSpread += spread;
-        leagueStats[league].sportbookPctSum += sportbookPct;
-        leagueStats[league].sportbookCount += 1;
+        leagueStats[league].sportbookFillValue += fillValue;
+        leagueStats[league].sportbookPointPctWeighted += (pointPct * fillValue);
         totalSportbookSpread += spread;
-        totalSportbookPctSum += sportbookPct;
-        totalSportbookCount += 1;
+        totalSportbookFillValue += fillValue;
+        totalSportbookPointPctWeighted += (pointPct * fillValue);
       }
     });
     
@@ -1103,13 +1111,14 @@ function loadPMSummary() {
       return;
     }
     
-    const beforePct = totalFillValue > 0 ? (totalBeforeSpread / totalFillValue) * 100 : 0;
-    const afterPct = totalFillValue > 0 ? (totalAfterSpread / totalFillValue) * 100 : 0;
-    const sportbookPct = totalSportbookCount > 0 ? (totalSportbookPctSum / totalSportbookCount) : 0;
+    const beforePct = totalBeforeFillValue > 0 ? (totalBeforeSpread / totalBeforeFillValue) * 100 : 0;
+    const afterPct = totalAfterFillValue > 0 ? (totalAfterSpread / totalAfterFillValue) * 100 : 0;
+    const sportbookRoiPct = totalSportbookFillValue > 0 ? (totalSportbookSpread / totalSportbookFillValue) * 100 : 0;
+    const sportbookPointPct = totalSportbookFillValue > 0 ? (totalSportbookPointPctWeighted / totalSportbookFillValue) : 0;
     
     const beforeColor = totalBeforeSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
     const afterColor = totalAfterSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
-    const sportbookColor = sportbookPct < 0 ? 'var(--accent-green)' : sportbookPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
+    const sportbookColor = sportbookRoiPct < 0 ? 'var(--accent-green)' : sportbookRoiPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
     
     let html = `
       <div style="margin-bottom: 2rem;">
@@ -1136,7 +1145,7 @@ function loadPMSummary() {
             <div style="space-y: 0.5rem;">
               ${sortedLeagues.map(league => {
                 const stats = leagueStats[league];
-                const leaguePct = stats.fillValue > 0 ? (stats.beforeSpread / stats.fillValue) * 100 : 0;
+                const leaguePct = stats.beforeFillValue > 0 ? (stats.beforeSpread / stats.beforeFillValue) * 100 : 0;
                 const leagueColor = stats.beforeSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
                 return `
                   <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
@@ -1175,7 +1184,7 @@ function loadPMSummary() {
             <div style="space-y: 0.5rem;">
               ${sortedLeagues.map(league => {
                 const stats = leagueStats[league];
-                const leaguePct = stats.fillValue > 0 ? (stats.afterSpread / stats.fillValue) * 100 : 0;
+                const leaguePct = stats.afterFillValue > 0 ? (stats.afterSpread / stats.afterFillValue) * 100 : 0;
                 const leagueColor = stats.afterSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
                 return `
                   <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
@@ -1207,15 +1216,19 @@ function loadPMSummary() {
                 ${totalSportbookSpread >= 0 ? '+' : ''}$${Math.abs(totalSportbookSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
               </div>
               <div style="font-size: 0.875rem; color: ${sportbookColor};">
-                ${sportbookPct >= 0 ? '+' : ''}${sportbookPct.toFixed(2)}%
+                ROI: ${sportbookRoiPct >= 0 ? '+' : ''}${sportbookRoiPct.toFixed(2)}%
+              </div>
+              <div style="font-size: 0.75rem; color: ${sportbookColor}; margin-top: 0.2rem;">
+                Point: ${sportbookPointPct >= 0 ? '+' : ''}${sportbookPointPct.toFixed(2)}%
               </div>
             </div>
             <div style="font-size: 0.75rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">TOTAL FILL VALUE x POLYMARKET SPORTSBOOK</div>
             <div style="space-y: 0.5rem;">
               ${sortedLeagues.map(league => {
                 const stats = leagueStats[league];
-                const leaguePct = stats.sportbookCount > 0 ? (stats.sportbookPctSum / stats.sportbookCount) : 0;
-                const leagueColor = leaguePct < 0 ? 'var(--accent-green)' : leaguePct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
+                const leagueRoiPct = stats.sportbookFillValue > 0 ? (stats.sportbookSpread / stats.sportbookFillValue) * 100 : 0;
+                const leaguePointPct = stats.sportbookFillValue > 0 ? (stats.sportbookPointPctWeighted / stats.sportbookFillValue) : 0;
+                const leagueColor = leagueRoiPct < 0 ? 'var(--accent-green)' : leagueRoiPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
                 return `
                   <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
                     <div style="display: flex; align-items: center; gap: 0.75rem;">
@@ -1227,7 +1240,7 @@ function loadPMSummary() {
                         ${stats.sportbookSpread >= 0 ? '+' : ''}$${Math.abs(stats.sportbookSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
                       </div>
                       <div style="font-size: 0.75rem; color: ${leagueColor};">
-                        (${leaguePct >= 0 ? '+' : ''}${leaguePct.toFixed(2)}%)
+                        (ROI ${leagueRoiPct >= 0 ? '+' : ''}${leagueRoiPct.toFixed(2)}% | Point ${leaguePointPct >= 0 ? '+' : ''}${leaguePointPct.toFixed(2)}%)
                       </div>
                     </div>
                   </div>
@@ -1257,10 +1270,12 @@ function loadPinnacleSummary() {
     const leagueStats = {};
     let totalFillValue = 0;
     let totalBeforeSpread = 0;
+    let totalBeforeFillValue = 0;
     let totalAfterSpread = 0;
+    let totalAfterFillValue = 0;
     let totalSportbookSpread = 0;
-    let totalSportbookPctSum = 0;
-    let totalSportbookCount = 0;
+    let totalSportbookFillValue = 0;
+    let totalSportbookPointPctWeighted = 0;
 
     orders.forEach(order => {
       const league = extractLeague(order.market_slug);
@@ -1278,10 +1293,12 @@ function loadPinnacleSummary() {
           fillValue: 0,
           fills: 0,
           beforeSpread: 0,
+          beforeFillValue: 0,
           afterSpread: 0,
+          afterFillValue: 0,
           sportbookSpread: 0,
-          sportbookPctSum: 0,
-          sportbookCount: 0
+          sportbookFillValue: 0,
+          sportbookPointPctWeighted: 0
         };
       }
 
@@ -1293,7 +1310,9 @@ function loadPinnacleSummary() {
         if (Number.isFinite(beforeBbo)) {
           const spread = (fillPrice - beforeBbo) * shares;
           leagueStats[league].beforeSpread += spread;
+          leagueStats[league].beforeFillValue += fillValue;
           totalBeforeSpread += spread;
+          totalBeforeFillValue += fillValue;
         }
       }
 
@@ -1302,7 +1321,9 @@ function loadPinnacleSummary() {
         if (Number.isFinite(afterBbo)) {
           const spread = (fillPrice - afterBbo) * shares;
           leagueStats[league].afterSpread += spread;
+          leagueStats[league].afterFillValue += fillValue;
           totalAfterSpread += spread;
+          totalAfterFillValue += fillValue;
         }
       }
 
@@ -1311,25 +1332,25 @@ function loadPinnacleSummary() {
       const oppDecimal = parsePercentageToDecimal(order?.pinnacle_after?.opponent_percentage);
       if (oppDecimal !== null) {
         const impliedFromOpp = 1 - oppDecimal;
-        const sportbookPct = (fillPrice - impliedFromOpp) * 100;
+        const sportbookPointPct = (fillPrice - impliedFromOpp) * 100;
         const sportbookSpread = (fillPrice - impliedFromOpp) * shares;
         leagueStats[league].sportbookSpread += sportbookSpread;
-        leagueStats[league].sportbookPctSum += sportbookPct;
-        leagueStats[league].sportbookCount += 1;
+        leagueStats[league].sportbookFillValue += fillValue;
+        leagueStats[league].sportbookPointPctWeighted += (sportbookPointPct * fillValue);
         totalSportbookSpread += sportbookSpread;
-        totalSportbookPctSum += sportbookPct;
-        totalSportbookCount += 1;
+        totalSportbookFillValue += fillValue;
+        totalSportbookPointPctWeighted += (sportbookPointPct * fillValue);
       } else if (order?.pinnacle_sportbook?.price_diff_pct !== undefined && order?.pinnacle_sportbook?.price_diff_pct !== null) {
         // Fallback for legacy rows missing opponent_percentage
-        const sportbookPct = Number(order.pinnacle_sportbook.price_diff_pct);
-        if (Number.isFinite(sportbookPct)) {
-          const sportbookSpread = (sportbookPct / 100) * shares;
+        const sportbookPointPct = Number(order.pinnacle_sportbook.price_diff_pct);
+        if (Number.isFinite(sportbookPointPct)) {
+          const sportbookSpread = (sportbookPointPct / 100) * shares;
           leagueStats[league].sportbookSpread += sportbookSpread;
-          leagueStats[league].sportbookPctSum += sportbookPct;
-          leagueStats[league].sportbookCount += 1;
+          leagueStats[league].sportbookFillValue += fillValue;
+          leagueStats[league].sportbookPointPctWeighted += (sportbookPointPct * fillValue);
           totalSportbookSpread += sportbookSpread;
-          totalSportbookPctSum += sportbookPct;
-          totalSportbookCount += 1;
+          totalSportbookFillValue += fillValue;
+          totalSportbookPointPctWeighted += (sportbookPointPct * fillValue);
         }
       }
     });
@@ -1341,13 +1362,14 @@ function loadPinnacleSummary() {
     const container = document.getElementById('pn-summary-container');
     if (!container) return;
 
-    const beforePct = totalFillValue > 0 ? (totalBeforeSpread / totalFillValue) * 100 : 0;
-    const afterPct = totalFillValue > 0 ? (totalAfterSpread / totalFillValue) * 100 : 0;
-    const sportbookPct = totalSportbookCount > 0 ? (totalSportbookPctSum / totalSportbookCount) : 0;
+    const beforePct = totalBeforeFillValue > 0 ? (totalBeforeSpread / totalBeforeFillValue) * 100 : 0;
+    const afterPct = totalAfterFillValue > 0 ? (totalAfterSpread / totalAfterFillValue) * 100 : 0;
+    const sportbookRoiPct = totalSportbookFillValue > 0 ? (totalSportbookSpread / totalSportbookFillValue) * 100 : 0;
+    const sportbookPointPct = totalSportbookFillValue > 0 ? (totalSportbookPointPctWeighted / totalSportbookFillValue) : 0;
 
     const beforeColor = totalBeforeSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
     const afterColor = totalAfterSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
-    const sportbookColor = sportbookPct < 0 ? 'var(--accent-green)' : sportbookPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
+    const sportbookColor = sportbookRoiPct < 0 ? 'var(--accent-green)' : sportbookRoiPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
 
     let html = `
       <div style="margin-bottom: 2rem;">
@@ -1368,7 +1390,7 @@ function loadPinnacleSummary() {
             <div>
               ${sortedLeagues.map(league => {
                 const stats = leagueStats[league];
-                const leaguePct = stats.fillValue > 0 ? (stats.beforeSpread / stats.fillValue) * 100 : 0;
+                const leaguePct = stats.beforeFillValue > 0 ? (stats.beforeSpread / stats.beforeFillValue) * 100 : 0;
                 const leagueColor = stats.beforeSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
                 return `
                   <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
@@ -1406,7 +1428,7 @@ function loadPinnacleSummary() {
             <div>
               ${sortedLeagues.map(league => {
                 const stats = leagueStats[league];
-                const leaguePct = stats.fillValue > 0 ? (stats.afterSpread / stats.fillValue) * 100 : 0;
+                const leaguePct = stats.afterFillValue > 0 ? (stats.afterSpread / stats.afterFillValue) * 100 : 0;
                 const leagueColor = stats.afterSpread < 0 ? 'var(--accent-green)' : 'var(--accent-red)';
                 return `
                   <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
@@ -1437,15 +1459,19 @@ function loadPinnacleSummary() {
                 ${totalSportbookSpread >= 0 ? '+' : ''}$${Math.abs(totalSportbookSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
               </div>
               <div style="font-size: 0.875rem; color: ${sportbookColor};">
-                ${sportbookPct >= 0 ? '+' : ''}${sportbookPct.toFixed(2)}%
+                ROI: ${sportbookRoiPct >= 0 ? '+' : ''}${sportbookRoiPct.toFixed(2)}%
+              </div>
+              <div style="font-size: 0.75rem; color: ${sportbookColor}; margin-top: 0.2rem;">
+                Point: ${sportbookPointPct >= 0 ? '+' : ''}${sportbookPointPct.toFixed(2)}%
               </div>
             </div>
             <div style="font-size: 0.75rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">TOTAL FILL VALUE x PINNACLE SPORTSBOOK</div>
             <div>
               ${sortedLeagues.map(league => {
                 const stats = leagueStats[league];
-                const leaguePct = stats.sportbookCount > 0 ? (stats.sportbookPctSum / stats.sportbookCount) : 0;
-                const leagueColor = leaguePct < 0 ? 'var(--accent-green)' : leaguePct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
+                const leagueRoiPct = stats.sportbookFillValue > 0 ? (stats.sportbookSpread / stats.sportbookFillValue) * 100 : 0;
+                const leaguePointPct = stats.sportbookFillValue > 0 ? (stats.sportbookPointPctWeighted / stats.sportbookFillValue) : 0;
+                const leagueColor = leagueRoiPct < 0 ? 'var(--accent-green)' : leagueRoiPct > 0 ? 'var(--accent-red)' : 'var(--text-primary)';
                 return `
                   <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color);">
                     <div style="display: flex; align-items: center; gap: 0.75rem;">
@@ -1457,7 +1483,7 @@ function loadPinnacleSummary() {
                         ${stats.sportbookSpread >= 0 ? '+' : ''}$${Math.abs(stats.sportbookSpread).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0})}
                       </div>
                       <div style="font-size: 0.75rem; color: ${leagueColor};">
-                        (${leaguePct >= 0 ? '+' : ''}${leaguePct.toFixed(2)}%)
+                        (ROI ${leagueRoiPct >= 0 ? '+' : ''}${leagueRoiPct.toFixed(2)}% | Point ${leaguePointPct >= 0 ? '+' : ''}${leaguePointPct.toFixed(2)}%)
                       </div>
                     </div>
                   </div>
