@@ -1558,6 +1558,15 @@ async function loadOppositePartiesSummary() {
       container.innerHTML = `<div style="text-align: center; padding: 2rem; color: var(--text-secondary);">No counterparties match "${counterpartyFilter}"</div>`;
       return;
     }
+
+    const timeLabelMap = {
+      '3h': 'Last 3 Hours',
+      '8h': 'Last 8 Hours',
+      '12h': 'Last 12 Hours',
+      '24h': 'Last 24 Hours',
+      'all': 'All Time'
+    };
+    const activeTimeLabel = timeLabelMap[timeFilter] || 'All Time';
     
     // Determine how many parties to show
     const partiesToShow = showAllParties ? filteredParties.length : Math.min(DEFAULT_PARTIES_TO_SHOW, filteredParties.length);
@@ -1574,6 +1583,9 @@ async function loadOppositePartiesSummary() {
             </div>
             <div style="font-size: 0.875rem; color: var(--text-secondary);">
               Showing ${partiesToShow} of ${filteredParties.length} counterparties${counterpartyFilter ? ` (filtered from ${parties.length})` : ''}
+            </div>
+            <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.25rem;">
+              Time Window: ${activeTimeLabel}
             </div>
           </div>
         </div>
