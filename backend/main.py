@@ -73,9 +73,9 @@ subscriptions = {}
 dome_task = None
 pending_updates = {}  # Track orders waiting for delayed updates
 
-# Order history storage (in-memory, 48 hours retention)
+# Order history storage (in-memory, 24 hours retention)
 order_history = []  # List of order dicts
-MAX_ORDER_AGE_HOURS = 48
+MAX_ORDER_AGE_HOURS = 24
 MAX_ORDER_HISTORY = 4000
 
 # Batching and worker pool for high-frequency updates
@@ -329,7 +329,7 @@ async def get_order_history():
         return {"orders": [], "count": 0, "error": str(e)}
 
 @app.get("/api/orders/opposite-parties")
-async def get_opposite_parties_summary(user_filter: Optional[str] = None):
+async def get_opposite_parties_summary(user_filter: Optional[str] = None, time_filter: Optional[str] = None):
     """Get summary of opposite parties (taker/maker addresses not in our wallet list)"""
     try:
         # Clean up old orders first
@@ -340,11 +340,26 @@ async def get_opposite_parties_summary(user_filter: Optional[str] = None):
         
         # Optional filter by user column (case-insensitive contains)
         user_filter_norm = (user_filter or "").strip().lower()
+        # Optional time filter aligned with frontend time selector
+        time_filter_norm = (time_filter or "all").strip().lower()
+        filter_hours_map = {
+            "3h": 3,
+            "8h": 8,
+            "12h": 12,
+            "24h": 24,
+        }
+        time_cutoff: Optional[float] = None
+        if time_filter_norm in filter_hours_map:
+            time_cutoff = datetime.now().timestamp() - (filter_hours_map[time_filter_norm] * 60 * 60)
 
         # Group orders by opposite party
         party_stats = {}  # {address: {'volume': 0, 'profit': 0, 'orders': 0, 'address': addr}}
         
         for order in order_history:
+            # Apply time filter if requested
+            if time_cutoff is not None and _get_order_time_for_retention(order) < time_cutoff:
+                continue
+
             # Get opposite party address (taker or maker that's not us)
             user_addr = order.get('user', '').lower() if order.get('user') else ''
             taker_addr = order.get('taker', '').lower() if order.get('taker') else ''
@@ -481,7 +496,8 @@ async def get_opposite_parties_summary(user_filter: Optional[str] = None):
             "parties": parties_list,
             "count": len(parties_list),
             "total_volume": sum(p['volume'] for p in parties_list),
-            "total_profit": sum(p['profit'] for p in parties_list)
+            "total_profit": sum(p['profit'] for p in parties_list),
+            "time_filter": time_filter_norm if time_filter_norm in filter_hours_map or time_filter_norm == "all" else "all"
         }
     except Exception as e:
         print(f"❌ Error getting opposite parties summary: {e}")
@@ -540,7 +556,7 @@ def _get_order_time_for_retention(order: dict) -> float:
         return 0.0
 
 def cleanup_old_orders():
-    """Remove orders older than 48 hours"""
+    """Remove orders older than the configured retention window."""
     global order_history
     if not order_history:
         return
@@ -1314,18 +1330,64 @@ async def update_polymarket_after(order_id: str, delay: int):
         reason = "120s final retry completed" if delay >= 120 else "after data found by 60s"
         print(f"✅ Completed updates for order {order_id} ({reason}, removed from pending)")
 
+async def unsubscribe_all_dome_subscriptions(websocket):
+    """Best-effort unsubscribe for all known Dome subscriptions."""
+    if not websocket:
+        return
+
+    active_ids = list(subscriptions.keys())
+    if not active_ids:
+        return
+
+    for subscription_id in active_ids:
+        try:
+            await websocket.send(json.dumps({
+                "action": "unsubscribe",
+                "subscription_id": subscription_id
+            }))
+        except Exception as e:
+            print(f"⚠️  Unsubscribe failed for {subscription_id}: {e}")
+            break
+
+    subscriptions.clear()
+
+async def mark_dome_disconnected():
+    """Mark Dome connection as disconnected and attempt graceful unsubscribe/close."""
+    global dome_ws, is_connected
+
+    ws = dome_ws
+    dome_ws = None
+    if is_connected:
+        is_connected = False
+        await sio.emit('status', {'connected': False})
+
+    if not ws:
+        subscriptions.clear()
+        return
+
+    try:
+        if not ws.closed:
+            await unsubscribe_all_dome_subscriptions(ws)
+            await ws.close()
+    except Exception as e:
+        print(f"⚠️  Error closing Dome websocket: {e}")
+        subscriptions.clear()
+
 async def connect_to_dome():
     """Connect to Dome API WebSocket"""
     global dome_ws, is_connected
     
     ws_url = f"wss://ws.domeapi.io/{DOME_API_KEY}"
     print(f"🔌 Connecting to Dome API: {ws_url.replace(DOME_API_KEY, '***')}")
-    
+    reconnect_delay = 1
+
     while True:
         try:
             async with websockets.connect(ws_url) as websocket:
                 dome_ws = websocket
                 is_connected = True
+                reconnect_delay = 1
+                subscriptions.clear()
                 print("✅ Connected to Dome API WebSocket")
                 
                 # Notify frontend
@@ -1338,17 +1400,17 @@ async def connect_to_dome():
                 async for message in websocket:
                     await handle_dome_message(message)
                     
-        except websockets.exceptions.ConnectionClosed:
-            print("🔌 Dome API connection closed, reconnecting...")
-            is_connected = False
-            await sio.emit('status', {'connected': False})
+        except websockets.exceptions.ConnectionClosed as e:
+            print(f"🔌 Dome API connection closed ({e.code}: {e.reason}), reconnecting...")
         except Exception as e:
             print(f"❌ Error: {e}")
-            is_connected = False
-            await sio.emit('status', {'connected': False})
+        finally:
+            await mark_dome_disconnected()
         
-        # Wait before reconnecting
-        await asyncio.sleep(5)
+        # Exponential backoff for retries
+        print(f"🔁 Reconnecting to Dome in {reconnect_delay}s...")
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, 30)
 
 async def subscribe_to_wallets(websocket):
     """Subscribe to wallet addresses"""

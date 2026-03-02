@@ -1513,6 +1513,10 @@ async function loadOppositePartiesSummary() {
     if (userFilter) {
       url.searchParams.set('user_filter', userFilter);
     }
+    // Keep counterparties table aligned with selected time filter (3h/8h/12h/24h/all)
+    if (timeFilter) {
+      url.searchParams.set('time_filter', timeFilter);
+    }
     const response = await fetch(url.toString());
     if (!response.ok) {
       console.error('❌ Failed to load opposite parties summary:', response.statusText);
