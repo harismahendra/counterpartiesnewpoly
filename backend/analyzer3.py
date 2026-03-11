@@ -2053,7 +2053,7 @@ class DeltasProcessor:
                     total_spread,
                     notes
                 FROM deltas
-                WHERE sportsbook = 'Pinnacle'
+                WHERE UPPER(COALESCE(sportsbook, '')) IN ('PINNACLE', 'CONSENSUS')
                     AND timestamp_ms >= %s
                     AND timestamp_ms <= %s
             """

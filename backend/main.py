@@ -85,6 +85,14 @@ BATCH_TIMEOUT = 0.5  # Wait max 0.5s before processing batch
 MAX_WORKERS = 5  # Max concurrent database queries
 db_semaphore = None  # Will be initialized in lifespan
 
+# Polymarket CLOB settings
+CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+CLOB_REQUEST_TIMEOUT_SECONDS = 5
+AFTER_MIN_AGE_SECONDS = 10
+AFTER_RETRY_SECONDS = 30
+AFTER_MAX_AGE_SECONDS = 120
+AFTER_COLLECTOR_POLL_SECONDS = 5
+
 # Cache for Polymarket API data (address -> data, expires after 1 hour)
 polymarket_cache = {}  # {address: {'data': {...}, 'expires_at': timestamp}}
 CACHE_DURATION = 3600  # 1 hour
@@ -243,6 +251,9 @@ async def lifespan(app: FastAPI):
         worker = asyncio.create_task(order_batch_processor())
         batch_workers.append(worker)
         print(f"🚀 Started batch processor worker {i+1}/{num_workers}")
+
+    after_collector_task = asyncio.create_task(polymarket_after_collector())
+    print("🚀 Started Polymarket after collector")
     
     try:
         yield
@@ -259,6 +270,12 @@ async def lifespan(app: FastAPI):
         cleanup_task.cancel()
         try:
             await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+        after_collector_task.cancel()
+        try:
+            await after_collector_task
         except asyncio.CancelledError:
             pass
         
@@ -802,7 +819,7 @@ def _normalize_deltas_record(record: Dict, fill_timestamp_ms: int, relation: str
         'opposing_team': record.get('opposing_team'),
         'seconds_from_fill': seconds_from_fill,
         'timestamp': timestamp_str,
-        'source': 'pinnacle'
+        'source': str(record.get('sportsbook') or 'pinnacle').strip().lower()
     }
 
 def _get_pinnacle_bbo_sync(market_slug: str, token_label: str, fill_timestamp_ms: int, relation: str):
@@ -834,13 +851,14 @@ def _get_pinnacle_bbo_sync(market_slug: str, token_label: str, fill_timestamp_ms
                 timestamp_ms,
                 timestamp,
                 sport,
+                sportsbook,
                 team,
                 opposing_team,
                 percentage,
                 bbo_price,
                 total_spread
             FROM deltas
-            WHERE sportsbook = 'Pinnacle'
+            WHERE UPPER(COALESCE(sportsbook, '')) IN ('PINNACLE', 'CONSENSUS')
               AND timestamp_ms >= %s
               AND timestamp_ms <= %s
               AND UPPER(sport) = %s
@@ -941,6 +959,107 @@ async def get_pinnacle_after(market_slug: str, token_label: str, fill_timestamp_
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _get_pinnacle_bbo_sync, market_slug, token_label, fill_timestamp_ms, 'after')
 
+def _current_timestamp_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def _format_timestamp_ms(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).strftime('%m/%d/%Y, %H:%M:%S')
+
+def _safe_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+def _build_polymarket_clob_snapshot(token_id: str, book_data: Dict, timestamp_ms: int) -> Optional[Dict]:
+    bids = book_data.get('bids') or []
+    asks = book_data.get('asks') or []
+
+    bid_prices = [_safe_float(bid.get('price')) for bid in bids]
+    ask_prices = [_safe_float(ask.get('price')) for ask in asks]
+
+    best_bid = max((price for price in bid_prices if price > 0), default=0.0)
+    best_ask = min((price for price in ask_prices if price > 0), default=0.0)
+
+    if best_bid <= 0 and best_ask <= 0:
+        return None
+
+    bbo = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else (best_bid or best_ask)
+    spread = (best_ask - best_bid) if best_bid > 0 and best_ask > 0 else None
+
+    return {
+        'token_id': token_id,
+        'bbo': bbo,
+        'best_bid': best_bid,
+        'best_ask': best_ask,
+        'spread': round(spread, 4) if spread is not None else None,
+        'timestamp': _format_timestamp_ms(timestamp_ms),
+        'timestamp_ms': timestamp_ms,
+        'source': 'clob_api'
+    }
+
+def _format_polymarket_snapshot_for_order(snapshot: Dict, fill_timestamp_ms: int, seconds_from_fill: Optional[float] = None) -> Dict:
+    if seconds_from_fill is None:
+        seconds_from_fill = (snapshot['timestamp_ms'] - fill_timestamp_ms) / 1000.0
+
+    return {
+        'bbo': snapshot['bbo'],
+        'best_bid': snapshot['best_bid'],
+        'best_ask': snapshot['best_ask'],
+        'spread': snapshot['spread'],
+        'seconds_from_fill': round(seconds_from_fill, 3),
+        'timestamp': snapshot['timestamp'],
+        'source': snapshot.get('source', 'clob_api')
+    }
+
+async def _fetch_polymarket_clob_price(session: aiohttp.ClientSession, token_id: str):
+    try:
+        async with session.get(CLOB_BOOK_URL, params={'token_id': token_id}) as response:
+            if response.status != 200:
+                print(f"⚠️  CLOB /book returned {response.status} for token_id={token_id}")
+                return token_id, None
+
+            book_data = await response.json(content_type=None)
+            snapshot = _build_polymarket_clob_snapshot(token_id, book_data, _current_timestamp_ms())
+            return token_id, snapshot
+    except Exception as e:
+        print(f"⚠️  Error fetching CLOB /book for token_id={token_id}: {e}")
+        return token_id, None
+
+async def fetch_polymarket_clob_prices(token_ids: List[str]) -> Dict[str, Dict]:
+    unique_token_ids = []
+    seen_token_ids = set()
+
+    for token_id in token_ids:
+        normalized_token_id = str(token_id or '').strip()
+        if normalized_token_id and normalized_token_id not in seen_token_ids:
+            seen_token_ids.add(normalized_token_id)
+            unique_token_ids.append(normalized_token_id)
+
+    if not unique_token_ids:
+        return {}
+
+    timeout = aiohttp.ClientTimeout(total=CLOB_REQUEST_TIMEOUT_SECONDS)
+    connector = aiohttp.TCPConnector(limit=min(len(unique_token_ids), 20))
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        results = await asyncio.gather(
+            *[_fetch_polymarket_clob_price(session, token_id) for token_id in unique_token_ids],
+            return_exceptions=True
+        )
+
+    clob_prices = {}
+    for result in results:
+        if isinstance(result, Exception):
+            print(f"⚠️  Unexpected error in CLOB batch fetch: {result}")
+            continue
+
+        token_id, snapshot = result
+        if snapshot:
+            clob_prices[token_id] = snapshot
+
+    return clob_prices
+
 async def get_polymarket_bbo_before(market_slug: str, token_label: str, fill_timestamp: int):
     """Get Polymarket Before BBO data - match by market_slug and token_label"""
     # Run database query in thread pool to avoid blocking
@@ -1029,7 +1148,8 @@ def _get_polymarket_bbo_before_sync(market_slug: str, token_label: str, fill_tim
             'best_ask': best_ask,
             'spread': round(spread, 4) if spread is not None else None,
             'seconds_from_fill': round((fill_timestamp - timestamp_ms_float) / 1000.0, 3),
-            'timestamp': timestamp_str
+            'timestamp': timestamp_str,
+            'source': 'database'
         }
         
     except Exception as e:
@@ -1169,7 +1289,8 @@ def _get_polymarket_bbo_after_sync(market_slug: str, token_label: str, fill_time
             'best_ask': best_ask,
             'spread': round(spread, 4) if spread is not None else None,
             'seconds_from_fill': round((timestamp_ms_float - fill_timestamp) / 1000.0, 3),
-            'timestamp': timestamp_str
+            'timestamp': timestamp_str,
+            'source': 'database'
         }
         
     except Exception as e:
@@ -1184,41 +1305,80 @@ def _get_polymarket_bbo_after_sync(market_slug: str, token_label: str, fill_time
 async def process_order_batch(orders: List[Dict]):
     """Process a batch of orders in parallel"""
     tasks = []
+    order_contexts = []
+    clob_token_ids = []
+    seen_token_ids = set()
+
     for order_data in orders:
         market_slug = order_data.get('market_slug')
         token_label = order_data.get('token_label', '').strip()
+        token_id = str(order_data.get('token_id') or '').strip()
         timestamp = order_data.get('timestamp')
-        
-        if market_slug and token_label and timestamp:
-            timestamp_ms = int(timestamp * 1000)
-            order_id = f"{order_data.get('tx_hash')}_{order_data.get('log_index')}"
-            
-            # Create task for fetching Before data
-            async def fetch_before_for_order(od, ms, tl, ts):
-                try:
-                    polymarket_before = await get_polymarket_bbo_before(ms, tl, ts)
-                    od['polymarket_before'] = polymarket_before
-                    pinnacle_before = await get_pinnacle_before(ms, tl, ts)
-                    od['pinnacle_before'] = pinnacle_before
-                    if polymarket_before or pinnacle_before:
-                        await sio.emit('order-update', od)
-                except Exception as e:
-                    print(f"⚠️  Error fetching Before data for {od.get('tx_hash')}: {e}")
-            
-            tasks.append(fetch_before_for_order(order_data, market_slug, token_label, timestamp_ms))
-            
-            # Store in pending updates for delayed processing
-            pending_updates[order_id] = {
-                'order_data': order_data,
-                'market_slug': market_slug,
-                'token_label': token_label,
-                'timestamp_ms': timestamp_ms
-            }
-            
-            # Schedule delayed updates
-            asyncio.create_task(update_polymarket_after(order_id, delay=10))
-            asyncio.create_task(update_polymarket_after(order_id, delay=60))
-            asyncio.create_task(update_polymarket_after(order_id, delay=120))
+
+        if not timestamp:
+            continue
+
+        if not token_id and not (market_slug and token_label):
+            continue
+
+        timestamp_ms = int(timestamp * 1000)
+        order_id = f"{order_data.get('tx_hash')}_{order_data.get('log_index')}"
+
+        order_contexts.append({
+            'order_id': order_id,
+            'order_data': order_data,
+            'market_slug': market_slug,
+            'token_label': token_label,
+            'token_id': token_id,
+            'timestamp_ms': timestamp_ms
+        })
+
+        pending_updates[order_id] = {
+            'order_data': order_data,
+            'market_slug': market_slug,
+            'token_label': token_label,
+            'token_id': token_id,
+            'timestamp_ms': timestamp_ms,
+            'last_after_attempt_ms': None
+        }
+
+        if token_id and token_id not in seen_token_ids:
+            seen_token_ids.add(token_id)
+            clob_token_ids.append(token_id)
+
+    clob_before = await fetch_polymarket_clob_prices(clob_token_ids)
+
+    async def fetch_before_for_order(context: Dict):
+        order_data = context['order_data']
+        market_slug = context['market_slug']
+        token_label = context['token_label']
+        token_id = context['token_id']
+        timestamp_ms = context['timestamp_ms']
+
+        try:
+            polymarket_before = None
+            clob_snapshot = clob_before.get(token_id) if token_id else None
+
+            if clob_snapshot:
+                polymarket_before = _format_polymarket_snapshot_for_order(clob_snapshot, timestamp_ms)
+            elif market_slug and token_label:
+                polymarket_before = await get_polymarket_bbo_before(market_slug, token_label, timestamp_ms)
+
+            order_data['polymarket_before'] = polymarket_before
+
+            pinnacle_before = None
+            if market_slug and token_label:
+                pinnacle_before = await get_pinnacle_before(market_slug, token_label, timestamp_ms)
+
+            order_data['pinnacle_before'] = pinnacle_before
+
+            if polymarket_before or pinnacle_before:
+                await sio.emit('order-update', order_data)
+        except Exception as e:
+            print(f"⚠️  Error fetching Before data for {order_data.get('tx_hash')}: {e}")
+
+    for context in order_contexts:
+        tasks.append(fetch_before_for_order(context))
     
     # Process all Before queries in parallel
     if tasks:
@@ -1257,78 +1417,127 @@ async def order_batch_processor():
             import traceback
             traceback.print_exc()
 
-async def update_polymarket_after(order_id: str, delay: int):
-    """Update Polymarket After and Sportbook data after delay (one-time update)"""
-    await asyncio.sleep(delay)
-    
-    if order_id not in pending_updates:
-        return  # Order no longer pending
-    
-    update_info = pending_updates[order_id]
+def _update_after_derived_fields(order_data: Dict, polymarket_after: Optional[Dict], pinnacle_after: Optional[Dict]):
+    fill_price = _safe_float(order_data.get('price'))
+    sportbook_bid = polymarket_after.get('best_bid') if polymarket_after else None
+
+    if sportbook_bid:
+        price_diff = fill_price - sportbook_bid
+        order_data['sportbook'] = {
+            'best_bid': sportbook_bid,
+            'fill_price': fill_price,
+            'price_diff': price_diff,
+            'price_diff_pct': (price_diff * 100) if sportbook_bid > 0 else 0
+        }
+    else:
+        order_data['sportbook'] = None
+
+    pinnacle_bid = pinnacle_after.get('bbo') if pinnacle_after else None
+    if pinnacle_bid:
+        pn_price_diff = fill_price - pinnacle_bid
+        order_data['pinnacle_sportbook'] = {
+            'best_bid': pinnacle_bid,
+            'fill_price': fill_price,
+            'price_diff': pn_price_diff,
+            'price_diff_pct': (pn_price_diff * 100) if pinnacle_bid > 0 else 0
+        }
+    else:
+        order_data['pinnacle_sportbook'] = None
+
+async def _process_single_pending_after_update(order_id: str, update_info: Dict, age_seconds: float, clob_snapshot: Optional[Dict]):
+    order_data = update_info['order_data']
     market_slug = update_info['market_slug']
     token_label = update_info['token_label']
     timestamp_ms = update_info['timestamp_ms']
-    order_data = update_info['order_data']
-    
-    # Get After data - match by token_label (looking for data from 10s after fill)
-    polymarket_after = await get_polymarket_bbo_after(market_slug, token_label, timestamp_ms)
-    pinnacle_after = await get_pinnacle_after(market_slug, token_label, timestamp_ms)
-    
-    if polymarket_after or pinnacle_after:
-        order_data['polymarket_after'] = polymarket_after
-        order_data['pinnacle_after'] = pinnacle_after
-        
-        # Calculate Sportbook (best_bid from after, and price difference)
-        fill_price = order_data.get('price', 0)
-        sportbook_bid = polymarket_after.get('best_bid') if polymarket_after else None
-        
-        if sportbook_bid:
-            price_diff = fill_price - sportbook_bid
-            order_data['sportbook'] = {
-                'best_bid': sportbook_bid,
-                'fill_price': fill_price,
-                'price_diff': price_diff,
-                # Percent-point diff on 0-1 price scale: (fill - best_bid) * 100
-                'price_diff_pct': (price_diff * 100) if sportbook_bid > 0 else 0
-            }
-        else:
-            order_data['sportbook'] = None
 
-        # Calculate Pinnacle Sportbook from Pinnacle After BBO (same style as PM sportbook)
-        pinnacle_bid = pinnacle_after.get('bbo') if pinnacle_after else None
-        if pinnacle_bid:
-            pn_price_diff = fill_price - pinnacle_bid
-            order_data['pinnacle_sportbook'] = {
-                'best_bid': pinnacle_bid,
-                'fill_price': fill_price,
-                'price_diff': pn_price_diff,
-                # Percent-point diff on 0-1 price scale: (fill - best_bid) * 100
-                'price_diff_pct': (pn_price_diff * 100) if pinnacle_bid > 0 else 0
-            }
-        else:
-            order_data['pinnacle_sportbook'] = None
-        
-        # Update order in history
+    polymarket_after = order_data.get('polymarket_after')
+    if polymarket_after is None:
+        if clob_snapshot:
+            polymarket_after = _format_polymarket_snapshot_for_order(
+                clob_snapshot,
+                timestamp_ms,
+                seconds_from_fill=age_seconds
+            )
+        elif market_slug and token_label:
+            polymarket_after = await get_polymarket_bbo_after(market_slug, token_label, timestamp_ms)
+
+    pinnacle_after = order_data.get('pinnacle_after')
+    if pinnacle_after is None and market_slug and token_label:
+        pinnacle_after = await get_pinnacle_after(market_slug, token_label, timestamp_ms)
+
+    pm_changed = polymarket_after is not None and order_data.get('polymarket_after') is None
+    pn_changed = pinnacle_after is not None and order_data.get('pinnacle_after') is None
+
+    if polymarket_after is not None:
+        order_data['polymarket_after'] = polymarket_after
+    if pinnacle_after is not None:
+        order_data['pinnacle_after'] = pinnacle_after
+
+    if pm_changed or pn_changed:
+        _update_after_derived_fields(order_data, order_data.get('polymarket_after'), order_data.get('pinnacle_after'))
         store_order_in_history(order_data)
-        
-        # Broadcast update to frontend
         await sio.emit('order-update', order_data)
-        print(f"🔄 Updated After/Sportbook/Pinnacle for order {order_id} (after {delay}s)")
-    else:
-        print(f"⚠️  No After data found (PM/Pinnacle) for order {order_id} after {delay}s")
-    
-    # Remove from pending:
-    # - at 60s if we already have PM/PN after data
-    # - always at 120s (final retry)
+        print(f"🔄 Updated After/Sportbook/Pinnacle for order {order_id} (age={round(age_seconds, 1)}s)")
+    elif polymarket_after is None and pinnacle_after is None:
+        print(f"⚠️  No After data found (PM/Pinnacle) for order {order_id} at age={round(age_seconds, 1)}s")
+
     has_pm_after = order_data.get('polymarket_after') is not None
     has_pn_after = order_data.get('pinnacle_after') is not None
-    has_any_after = has_pm_after or has_pn_after
+    should_finalize = age_seconds >= AFTER_MAX_AGE_SECONDS or (has_pm_after and has_pn_after)
 
-    should_finalize = delay >= 120 or (delay >= 60 and has_any_after)
     if should_finalize and order_id in pending_updates:
         del pending_updates[order_id]
-        reason = "120s final retry completed" if delay >= 120 else "after data found by 60s"
+        reason = "timeout reached" if age_seconds >= AFTER_MAX_AGE_SECONDS else "after data collected"
         print(f"✅ Completed updates for order {order_id} ({reason}, removed from pending)")
+
+async def process_pending_polymarket_after_updates():
+    if not pending_updates:
+        return
+
+    now_ms = _current_timestamp_ms()
+    eligible_updates = []
+    token_ids = []
+    seen_token_ids = set()
+
+    for order_id, update_info in list(pending_updates.items()):
+        age_seconds = (now_ms - update_info['timestamp_ms']) / 1000.0
+        if age_seconds < AFTER_MIN_AGE_SECONDS:
+            continue
+
+        last_after_attempt_ms = update_info.get('last_after_attempt_ms')
+        if last_after_attempt_ms is not None and (now_ms - last_after_attempt_ms) < (AFTER_RETRY_SECONDS * 1000):
+            continue
+
+        update_info['last_after_attempt_ms'] = now_ms
+        eligible_updates.append((order_id, update_info, age_seconds))
+
+        token_id = update_info.get('token_id')
+        if token_id and token_id not in seen_token_ids:
+            seen_token_ids.add(token_id)
+            token_ids.append(token_id)
+
+    if not eligible_updates:
+        return
+
+    clob_after = await fetch_polymarket_clob_prices(token_ids)
+    tasks = []
+
+    for order_id, update_info, age_seconds in eligible_updates:
+        token_id = update_info.get('token_id')
+        clob_snapshot = clob_after.get(token_id) if token_id else None
+        tasks.append(_process_single_pending_after_update(order_id, update_info, age_seconds, clob_snapshot))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+async def polymarket_after_collector():
+    """Periodically fetch Polymarket After snapshots using CLOB first, then DB fallback."""
+    while True:
+        try:
+            await process_pending_polymarket_after_updates()
+        except Exception as e:
+            print(f"❌ Error in Polymarket after collector: {e}")
+        await asyncio.sleep(AFTER_COLLECTOR_POLL_SECONDS)
 
 async def unsubscribe_all_dome_subscriptions(websocket):
     """Best-effort unsubscribe for all known Dome subscriptions."""
