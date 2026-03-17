@@ -749,6 +749,16 @@ def get_league_from_market_slug(market_slug: str) -> Optional[str]:
         return None
     return parts[0].upper()
 
+def should_run_pinnacle_matching(market_slug: str) -> bool:
+    """Only run Pinnacle matching for moneyline-style slugs."""
+    slug = (market_slug or '').strip().lower()
+    if not slug:
+        return False
+    # Spread/total market slugs do not map reliably to deltas team rows.
+    if '-spread-' in slug or '-total-' in slug:
+        return False
+    return True
+
 def get_pinnacle_db_connection():
     """Create PostgreSQL database connection for Pinnacle deltas (DATABASE_URL)."""
     database_url = os.getenv('DATABASE_URL')
@@ -1367,7 +1377,7 @@ async def process_order_batch(orders: List[Dict]):
             order_data['polymarket_before'] = polymarket_before
 
             pinnacle_before = None
-            if market_slug and token_label:
+            if market_slug and token_label and should_run_pinnacle_matching(market_slug):
                 pinnacle_before = await get_pinnacle_before(market_slug, token_label, timestamp_ms)
 
             order_data['pinnacle_before'] = pinnacle_before
@@ -1461,8 +1471,9 @@ async def _process_single_pending_after_update(order_id: str, update_info: Dict,
         elif market_slug and token_label:
             polymarket_after = await get_polymarket_bbo_after(market_slug, token_label, timestamp_ms)
 
+    needs_pinnacle = should_run_pinnacle_matching(market_slug)
     pinnacle_after = order_data.get('pinnacle_after')
-    if pinnacle_after is None and market_slug and token_label:
+    if pinnacle_after is None and needs_pinnacle and market_slug and token_label:
         pinnacle_after = await get_pinnacle_after(market_slug, token_label, timestamp_ms)
 
     pm_changed = polymarket_after is not None and order_data.get('polymarket_after') is None
@@ -1483,7 +1494,7 @@ async def _process_single_pending_after_update(order_id: str, update_info: Dict,
 
     has_pm_after = order_data.get('polymarket_after') is not None
     has_pn_after = order_data.get('pinnacle_after') is not None
-    should_finalize = age_seconds >= AFTER_MAX_AGE_SECONDS or (has_pm_after and has_pn_after)
+    should_finalize = age_seconds >= AFTER_MAX_AGE_SECONDS or (has_pm_after and (not needs_pinnacle or has_pn_after))
 
     if should_finalize and order_id in pending_updates:
         del pending_updates[order_id]
