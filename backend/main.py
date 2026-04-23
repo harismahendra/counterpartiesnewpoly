@@ -96,6 +96,10 @@ AFTER_COLLECTOR_POLL_SECONDS = 5
 # Cache for Polymarket API data (address -> data, expires after 1 hour)
 polymarket_cache = {}  # {address: {'data': {...}, 'expires_at': timestamp}}
 CACHE_DURATION = 3600  # 1 hour
+TOKEN_METADATA_CACHE_DURATION = 3 * 3600  # 3 hours
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+polymarket_token_metadata_cache = {}  # {token_id: {'data': {...}, 'expires_at': timestamp}}
+polymarket_token_metadata_inflight = {}  # {token_id: asyncio.Task}
 
 # Team mappings for Pinnacle deltas matching (from analyzer3.py approach)
 TEAM_MAPPINGS = {
@@ -681,6 +685,117 @@ async def get_polymarket_account_info(address: str):
     except Exception as e:
         print(f"❌ Error getting Polymarket account info for {address}: {e}")
         return None
+
+def _parse_json_list_field(raw_value):
+    if isinstance(raw_value, list):
+        return raw_value
+    if isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+async def get_polymarket_token_metadata(token_id: str):
+    """Resolve token metadata (label/slug/title/condition) from Gamma markets API."""
+    global polymarket_token_metadata_cache, polymarket_token_metadata_inflight
+
+    token_id_normalized = str(token_id or '').strip()
+    if not token_id_normalized:
+        return None
+
+    now_ts = datetime.now().timestamp()
+    cached = polymarket_token_metadata_cache.get(token_id_normalized)
+    if cached and cached.get('expires_at', 0) > now_ts:
+        return cached.get('data')
+
+    existing_task = polymarket_token_metadata_inflight.get(token_id_normalized)
+    if existing_task:
+        return await existing_task
+
+    async def _fetch_metadata():
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+                async with session.get(
+                    GAMMA_MARKETS_URL,
+                    params={'clob_token_ids': token_id_normalized}
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+
+                    payload = await resp.json(content_type=None)
+                    if not isinstance(payload, list) or not payload:
+                        return None
+
+                    market = payload[0] if isinstance(payload[0], dict) else None
+                    if not market:
+                        return None
+
+                    clob_token_ids = _parse_json_list_field(market.get('clobTokenIds'))
+                    outcomes = _parse_json_list_field(market.get('outcomes'))
+
+                    token_label = None
+                    for idx, candidate_token_id in enumerate(clob_token_ids):
+                        if str(candidate_token_id).strip() == token_id_normalized:
+                            if idx < len(outcomes):
+                                token_label = outcomes[idx]
+                            break
+
+                    metadata = {
+                        'token_id': token_id_normalized,
+                        'token_label': token_label,
+                        'market_slug': market.get('slug'),
+                        'title': market.get('question') or market.get('title'),
+                        'condition_id': market.get('conditionId')
+                    }
+
+                    polymarket_token_metadata_cache[token_id_normalized] = {
+                        'data': metadata,
+                        'expires_at': datetime.now().timestamp() + TOKEN_METADATA_CACHE_DURATION
+                    }
+                    return metadata
+        except Exception as e:
+            print(f"⚠️  Error fetching token metadata for token_id={token_id_normalized}: {e}")
+            return None
+
+    task = asyncio.create_task(_fetch_metadata())
+    polymarket_token_metadata_inflight[token_id_normalized] = task
+    try:
+        return await task
+    finally:
+        polymarket_token_metadata_inflight.pop(token_id_normalized, None)
+
+async def backfill_order_metadata_from_token_id(order_data: Dict):
+    """Fill missing order fields from token_id via Polymarket Gamma API."""
+    if not isinstance(order_data, dict):
+        return
+
+    token_id = str(order_data.get('token_id') or '').strip()
+    if not token_id:
+        return
+
+    needs_backfill = (
+        not str(order_data.get('token_label') or '').strip() or
+        not str(order_data.get('market_slug') or '').strip() or
+        not str(order_data.get('title') or '').strip() or
+        not str(order_data.get('condition_id') or '').strip()
+    )
+    if not needs_backfill:
+        return
+
+    metadata = await get_polymarket_token_metadata(token_id)
+    if not metadata:
+        return
+
+    if not str(order_data.get('token_label') or '').strip() and metadata.get('token_label'):
+        order_data['token_label'] = metadata['token_label']
+    if not str(order_data.get('market_slug') or '').strip() and metadata.get('market_slug'):
+        order_data['market_slug'] = metadata['market_slug']
+    if not str(order_data.get('title') or '').strip() and metadata.get('title'):
+        order_data['title'] = metadata['title']
+    if not str(order_data.get('condition_id') or '').strip() and metadata.get('condition_id'):
+        order_data['condition_id'] = metadata['condition_id']
 
 @sio.event
 async def connect(sid, environ):
@@ -1666,6 +1781,8 @@ async def handle_dome_message(message: str):
             order_data = data['data']
             order_data['subscription_id'] = data['subscription_id']
             order_data['received_at'] = datetime.now(timezone.utc).isoformat()
+
+            await backfill_order_metadata_from_token_id(order_data)
             
             print(f"📊 Order update: {order_data.get('side')} {order_data.get('token_label')} @ ${order_data.get('price')}")
             
