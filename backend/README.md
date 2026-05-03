@@ -1,6 +1,6 @@
-# Dome API Backend (Python)
+# Predexon Streaming Backend (Python)
 
-Python backend for Dome API WebSocket connection.
+Python backend for Predexon WebSocket streaming and frontend Socket.IO broadcasting.
 
 ## Setup
 
@@ -33,6 +33,13 @@ uvicorn main:app --reload --port 8000
 ## Environment Variables
 
 See `.env.example` for all available configuration options.
+
+Required for streaming:
+
+- `PREDEXON_API_KEY` (preferred)
+- `DOME_API_KEY` (legacy fallback; kept for backward compatibility)
+
+The backend subscribes to Predexon `orders` events using configured wallet addresses.
 
 ## API Endpoints
 

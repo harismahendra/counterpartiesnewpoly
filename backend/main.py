@@ -1,6 +1,6 @@
 """
-Dome API WebSocket Backend
-Handles WebSocket connection to Dome API and broadcasts to frontend
+Predexon WebSocket Backend
+Handles WebSocket connection to Predexon and broadcasts to frontend
 """
 import asyncio
 import json
@@ -32,7 +32,10 @@ else:
     load_dotenv()  # Fallback to default location
 
 # Configuration
-DOME_API_KEY = os.getenv('DOME_API_KEY')
+PREDEXON_API_KEY = os.getenv('PREDEXON_API_KEY')
+LEGACY_DOME_API_KEY = os.getenv('DOME_API_KEY')
+STREAM_API_KEY = PREDEXON_API_KEY or LEGACY_DOME_API_KEY
+STREAM_PROVIDER_NAME = 'Predexon'
 PLATFORM = os.getenv('PLATFORM', 'polymarket')
 WS_VERSION = int(os.getenv('WS_VERSION', '1'))
 # Use PORT from Render in production, fallback to BACKEND_PORT or 8000
@@ -67,10 +70,10 @@ def load_wallet_addresses() -> List[str]:
 WALLET_ADDRESSES = load_wallet_addresses()
 
 # WebSocket connection state
-dome_ws = None
+stream_ws = None
 is_connected = False
 subscriptions = {}
-dome_task = None
+stream_task = None
 pending_updates = {}  # Track orders waiting for delayed updates
 
 # Order history storage (in-memory, 24 hours retention)
@@ -150,9 +153,9 @@ TEAM_MAPPINGS = {
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown"""
     # Startup
-    global dome_task
+    global stream_task
     
-    print(f"🚀 Starting Dome API Backend...")
+    print(f"🚀 Starting {STREAM_PROVIDER_NAME} API Backend...")
     print(f"📋 Configuration:")
     print(f"   Platform: {PLATFORM}")
     print(f"   Version: {WS_VERSION}")
@@ -223,15 +226,15 @@ async def lifespan(app: FastAPI):
             print(f"❌ Could not connect to Polymarket database")
             print(f"⚠️  Matching will be disabled. Check DATABASE_URL_POLY in .env")
     
-    if DOME_API_KEY and WALLET_ADDRESSES:
+    if STREAM_API_KEY and WALLET_ADDRESSES:
         print(f"\n📋 Wallet Configuration:")
         print(f"   Wallets: {len(WALLET_ADDRESSES)}")
         print(f"   Addresses: {', '.join(WALLET_ADDRESSES)}\n")
         
-        # Start Dome WebSocket connection
-        dome_task = asyncio.create_task(connect_to_dome())
-    elif not DOME_API_KEY:
-        print("\n❌ DOME_API_KEY is required in .env file")
+        # Start Predexon WebSocket connection
+        stream_task = asyncio.create_task(connect_to_predexon())
+    elif not STREAM_API_KEY:
+        print("\n❌ PREDEXON_API_KEY is required in .env file")
     elif not WALLET_ADDRESSES:
         print("\n❌ No wallet addresses configured")
     
@@ -283,17 +286,17 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         
-        if dome_task:
-            dome_task.cancel()
+        if stream_task:
+            stream_task.cancel()
             try:
-                await dome_task
+                await stream_task
             except asyncio.CancelledError:
                 pass
-        if dome_ws:
-            await dome_ws.close()
+        if stream_ws:
+            await stream_ws.close()
 
 # FastAPI app with lifespan
-app = FastAPI(title="Dome API Backend", lifespan=lifespan)
+app = FastAPI(title="Predexon API Backend", lifespan=lifespan)
 
 # Socket.IO server for real-time updates
 sio = socketio.AsyncServer(
@@ -1665,8 +1668,8 @@ async def polymarket_after_collector():
             print(f"❌ Error in Polymarket after collector: {e}")
         await asyncio.sleep(AFTER_COLLECTOR_POLL_SECONDS)
 
-async def unsubscribe_all_dome_subscriptions(websocket):
-    """Best-effort unsubscribe for all known Dome subscriptions."""
+async def unsubscribe_all_subscriptions(websocket):
+    """Best-effort unsubscribe for all known provider subscriptions."""
     if not websocket:
         return
 
@@ -1686,12 +1689,12 @@ async def unsubscribe_all_dome_subscriptions(websocket):
 
     subscriptions.clear()
 
-async def mark_dome_disconnected():
-    """Mark Dome connection as disconnected and attempt graceful unsubscribe/close."""
-    global dome_ws, is_connected
+async def mark_stream_disconnected():
+    """Mark stream connection as disconnected and attempt graceful unsubscribe/close."""
+    global stream_ws, is_connected
 
-    ws = dome_ws
-    dome_ws = None
+    ws = stream_ws
+    stream_ws = None
     if is_connected:
         is_connected = False
         await sio.emit('status', {'connected': False})
@@ -1702,28 +1705,28 @@ async def mark_dome_disconnected():
 
     try:
         if not ws.closed:
-            await unsubscribe_all_dome_subscriptions(ws)
+            await unsubscribe_all_subscriptions(ws)
             await ws.close()
     except Exception as e:
-        print(f"⚠️  Error closing Dome websocket: {e}")
+        print(f"⚠️  Error closing {STREAM_PROVIDER_NAME} websocket: {e}")
         subscriptions.clear()
 
-async def connect_to_dome():
-    """Connect to Dome API WebSocket"""
-    global dome_ws, is_connected
+async def connect_to_predexon():
+    """Connect to Predexon WebSocket."""
+    global stream_ws, is_connected
     
-    ws_url = f"wss://ws.domeapi.io/{DOME_API_KEY}"
-    print(f"🔌 Connecting to Dome API: {ws_url.replace(DOME_API_KEY, '***')}")
+    ws_url = f"wss://wss.predexon.com/v1/{STREAM_API_KEY}"
+    print(f"🔌 Connecting to {STREAM_PROVIDER_NAME} API: {ws_url.replace(STREAM_API_KEY, '***')}")
     reconnect_delay = 1
 
     while True:
         try:
-            async with websockets.connect(ws_url) as websocket:
-                dome_ws = websocket
+            async with websockets.connect(ws_url, ping_interval=30, ping_timeout=60) as websocket:
+                stream_ws = websocket
                 is_connected = True
                 reconnect_delay = 1
                 subscriptions.clear()
-                print("✅ Connected to Dome API WebSocket")
+                print(f"✅ Connected to {STREAM_PROVIDER_NAME} WebSocket")
                 
                 # Notify frontend
                 await sio.emit('status', {'connected': True})
@@ -1733,17 +1736,17 @@ async def connect_to_dome():
                 
                 # Listen for messages
                 async for message in websocket:
-                    await handle_dome_message(message)
+                    await handle_predexon_message(message)
                     
         except websockets.exceptions.ConnectionClosed as e:
-            print(f"🔌 Dome API connection closed ({e.code}: {e.reason}), reconnecting...")
+            print(f"🔌 {STREAM_PROVIDER_NAME} API connection closed ({e.code}: {e.reason}), reconnecting...")
         except Exception as e:
             print(f"❌ Error: {e}")
         finally:
-            await mark_dome_disconnected()
+            await mark_stream_disconnected()
         
         # Exponential backoff for retries
-        print(f"🔁 Reconnecting to Dome in {reconnect_delay}s...")
+        print(f"🔁 Reconnecting to {STREAM_PROVIDER_NAME} in {reconnect_delay}s...")
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, 30)
 
@@ -1762,13 +1765,22 @@ async def subscribe_to_wallets(websocket):
     print(f"📡 Subscribing to {len(WALLET_ADDRESSES)} wallet(s)")
     await websocket.send(json.dumps(subscribe_message))
 
-async def handle_dome_message(message: str):
-    """Handle incoming messages from Dome API"""
+async def handle_predexon_message(message: str):
+    """Handle incoming messages from Predexon WebSocket."""
     try:
         data = json.loads(message)
+
+        message_type = data.get('type')
+
+        # Predexon sends explicit errors for auth/subscription limits.
+        if message_type == 'error':
+            error_code = data.get('code', 'UNKNOWN')
+            error_message = data.get('message', 'No message')
+            print(f"❌ {STREAM_PROVIDER_NAME} error [{error_code}]: {error_message}")
+            return
         
         # Handle subscription acknowledgment
-        if data.get('type') == 'ack' and data.get('subscription_id'):
+        if message_type == 'ack' and data.get('subscription_id'):
             subscription_id = data['subscription_id']
             subscriptions[subscription_id] = {
                 'created_at': datetime.now(timezone.utc).isoformat(),
@@ -1777,7 +1789,7 @@ async def handle_dome_message(message: str):
             print(f"✅ Subscription acknowledged: {subscription_id}")
         
         # Handle order updates
-        if data.get('type') == 'event' and data.get('subscription_id') and data.get('data'):
+        if message_type == 'event' and data.get('subscription_id') and data.get('data'):
             order_data = data['data']
             order_data['subscription_id'] = data['subscription_id']
             order_data['received_at'] = datetime.now(timezone.utc).isoformat()
